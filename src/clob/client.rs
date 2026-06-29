@@ -1779,28 +1779,10 @@ impl<K: Kind> Client<Authenticated<K>> {
             .chain_id()
             .expect("Validated not none in `authenticate`");
 
-        let token_id = match &payload {
-            OrderPayload::V1(p) => p.order.tokenId,
-            OrderPayload::V2(p) => p.order.tokenId,
-        };
-        let neg_risk = self.neg_risk(token_id).await?.neg_risk;
-        let config = contract_config(chain_id, neg_risk)
-            .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
+        let domain = self.order_signing_domain(chain_id, &payload).await?;
 
         let signature = match &payload {
             OrderPayload::V2(p) => {
-                let exchange = config.exchange_v2.ok_or_else(|| {
-                    Error::validation(format!(
-                        "No V2 exchange contract configured for chain_id={chain_id}, neg_risk={neg_risk}"
-                    ))
-                })?;
-                let domain = Eip712Domain {
-                    name: ORDER_NAME,
-                    version: VERSION_V2,
-                    chain_id: Some(U256::from(chain_id)),
-                    verifying_contract: Some(exchange),
-                    ..Eip712Domain::default()
-                };
                 if p.order.signatureType == SignatureType::Poly1271 as u8 {
                     self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
                         .await?
@@ -1811,19 +1793,10 @@ impl<K: Kind> Client<Authenticated<K>> {
                         .into()
                 }
             }
-            OrderPayload::V1(p) => {
-                let domain = Eip712Domain {
-                    name: ORDER_NAME,
-                    version: VERSION_V1,
-                    chain_id: Some(U256::from(chain_id)),
-                    verifying_contract: Some(config.exchange),
-                    ..Eip712Domain::default()
-                };
-                signer
-                    .sign_hash(&p.order.eip712_signing_hash(&domain))
-                    .await?
-                    .into()
-            }
+            OrderPayload::V1(p) => signer
+                .sign_hash(&p.order.eip712_signing_hash(&domain))
+                .await?
+                .into(),
         };
 
         Ok(SignedOrder {
@@ -1833,6 +1806,81 @@ impl<K: Kind> Client<Authenticated<K>> {
             owner: self.state().credentials.key,
             post_only,
             defer_exec,
+        })
+    }
+
+    /// The EIP-712 domain selected for an order payload — version-tagged
+    /// (V2 signs against `exchange_v2` with domain version `"2"`; V1 against
+    /// the legacy `exchange` with version `"1"`). Factored out of [`sign`] so
+    /// it is the SINGLE place the `ORDER_NAME` / domain-version constants are
+    /// assembled — both [`sign`] and [`order_signing_hash`] consume it, so the
+    /// hash they produce is guaranteed identical. Performs a `neg_risk` lookup
+    /// (cached after first use per token).
+    ///
+    /// [`sign`]: Client::sign
+    /// [`order_signing_hash`]: Client::order_signing_hash
+    async fn order_signing_domain(
+        &self,
+        chain_id: u64,
+        payload: &OrderPayload,
+    ) -> Result<Eip712Domain> {
+        let token_id = match payload {
+            OrderPayload::V1(p) => p.order.tokenId,
+            OrderPayload::V2(p) => p.order.tokenId,
+        };
+        let neg_risk = self.neg_risk(token_id).await?.neg_risk;
+        let config = contract_config(chain_id, neg_risk)
+            .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
+        let domain = match payload {
+            OrderPayload::V2(_) => {
+                let exchange = config.exchange_v2.ok_or_else(|| {
+                    Error::validation(format!(
+                        "No V2 exchange contract configured for chain_id={chain_id}, neg_risk={neg_risk}"
+                    ))
+                })?;
+                Eip712Domain {
+                    name: ORDER_NAME,
+                    version: VERSION_V2,
+                    chain_id: Some(U256::from(chain_id)),
+                    verifying_contract: Some(exchange),
+                    ..Eip712Domain::default()
+                }
+            }
+            OrderPayload::V1(_) => Eip712Domain {
+                name: ORDER_NAME,
+                version: VERSION_V1,
+                chain_id: Some(U256::from(chain_id)),
+                verifying_contract: Some(config.exchange),
+                ..Eip712Domain::default()
+            },
+        };
+        Ok(domain)
+    }
+
+    /// The EIP-712 signing hash for an order — the exact value [`sign`] feeds to
+    /// the signer, and (for non-1271 orders) the id Polymarket assigns to the
+    /// resulting order. Lets a caller learn an order's id at SIGN time, before
+    /// the place POST resolves, without re-deriving the domain constants. Uses
+    /// the same [`order_signing_domain`] as [`sign`] so the value matches.
+    ///
+    /// # Panics
+    /// Panics if the signer carries no chain id — guaranteed set by
+    /// `authenticate`, mirroring [`sign`].
+    ///
+    /// [`sign`]: Client::sign
+    /// [`order_signing_domain`]: Client::order_signing_domain
+    pub async fn order_signing_hash<S: Signer>(
+        &self,
+        signer: &S,
+        payload: &OrderPayload,
+    ) -> Result<B256> {
+        let chain_id = signer
+            .chain_id()
+            .expect("Validated not none in `authenticate`");
+        let domain = self.order_signing_domain(chain_id, payload).await?;
+        Ok(match payload {
+            OrderPayload::V2(p) => p.order.eip712_signing_hash(&domain),
+            OrderPayload::V1(p) => p.order.eip712_signing_hash(&domain),
         })
     }
 
