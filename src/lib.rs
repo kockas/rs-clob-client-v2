@@ -64,6 +64,7 @@ static CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
         conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
         neg_risk_adapter: None,
         exchange_v2: Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+        exchange_v3: Some(address!("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa")),
     },
     80002_u64 => ContractConfig {
         exchange: address!("0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40"),
@@ -71,6 +72,7 @@ static CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
         conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
         neg_risk_adapter: None,
         exchange_v2: Some(address!("0xE111180000d2663C0091e4f400237545B87B996B")),
+        exchange_v3: Some(address!("0x9fE6e61422AdB6F610d8597F9684b16912D50C3D")),
     },
 };
 
@@ -81,6 +83,7 @@ static NEG_RISK_CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
         conditional_tokens: address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
         exchange_v2: Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
+        exchange_v3: Some(address!("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa")),
     },
     80002_u64 => ContractConfig {
         exchange: address!("0xC5d563A36AE78145C45a50134d48A1215220f80a"),
@@ -88,6 +91,7 @@ static NEG_RISK_CONFIG: phf::Map<ChainId, ContractConfig> = phf_map! {
         conditional_tokens: address!("0x69308FB512518e39F9b16112fA8d994F4e2Bf8bB"),
         neg_risk_adapter: Some(address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296")),
         exchange_v2: Some(address!("0xe2222d279d744050d28e00520010520000310F59")),
+        exchange_v3: Some(address!("0x9fE6e61422AdB6F610d8597F9684b16912D50C3D")),
     },
 };
 
@@ -125,6 +129,8 @@ pub struct ContractConfig {
     pub neg_risk_adapter: Option<Address>,
     /// The V2 exchange contract address (CTF Exchange V2).
     pub exchange_v2: Option<Address>,
+    /// The V3 exchange contract address used for Polymarket V2 position orders.
+    pub exchange_v3: Option<Address>,
 }
 
 /// Wallet contract configuration for CREATE2 address derivation
@@ -376,6 +382,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn config_contains_polygon_exchange_v3() {
+        let cfg = contract_config(POLYGON, false).expect("missing config");
+        assert_eq!(
+            cfg.exchange_v3,
+            Some(address!("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa"))
+        );
+    }
+
+    #[test]
     fn config_contains_80002() {
         let cfg = contract_config(AMOY, false).expect("missing config");
         assert_eq!(
@@ -385,6 +400,10 @@ mod tests {
         assert_eq!(
             cfg.collateral,
             address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+        );
+        assert_eq!(
+            cfg.exchange_v3,
+            Some(address!("0x9fE6e61422AdB6F610d8597F9684b16912D50C3D"))
         );
     }
 
@@ -398,6 +417,10 @@ mod tests {
         assert_eq!(
             cfg.collateral,
             address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+        );
+        assert_eq!(
+            cfg.exchange_v3,
+            Some(address!("0x9fE6e61422AdB6F610d8597F9684b16912D50C3D"))
         );
     }
 

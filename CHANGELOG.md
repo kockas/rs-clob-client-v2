@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CLOB support for Polymarket V2 position IDs and Exchange V3 orders.
+
 ### Fork HTTP admission support
 
 - Add authenticated signer rate-tier reads and observed single/batch order and

@@ -70,6 +70,7 @@ use crate::{
 const ORDER_NAME: Option<Cow<'static, str>> = Some(Cow::Borrowed("Polymarket CTF Exchange"));
 const VERSION_V1: Option<Cow<'static, str>> = Some(Cow::Borrowed("1"));
 const VERSION_V2: Option<Cow<'static, str>> = Some(Cow::Borrowed("2"));
+const VERSION_V3: Option<Cow<'static, str>> = Some(Cow::Borrowed("3"));
 const DEPOSIT_WALLET_NAME: &str = "DepositWallet";
 const DEPOSIT_WALLET_VERSION: &str = "1";
 const ORDER_TYPE_STRING: &str = concat!(
@@ -897,15 +898,15 @@ impl<S: State> Client<S> {
         Ok(body.version)
     }
 
-    /// Retrieves the midpoint price for a single market outcome token.
+    /// Retrieves the midpoint price for a single exchange asset.
     ///
     /// The midpoint is the average of the best bid and best ask prices,
     /// calculated as `(best_bid + best_ask) / 2`. This represents a fair
-    /// market price estimate for the token.
+    /// market price estimate for the CTF token or Polymarket V2 position.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn midpoint(&self, request: &MidpointRequest) -> Result<MidpointResponse> {
         let params = request.query_params(None);
         let request = self
@@ -916,14 +917,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves midpoint prices for multiple market outcome tokens in a single request.
+    /// Retrieves midpoint prices for multiple exchange assets in a single request.
     ///
     /// This is the batch version of [`Self::midpoint`]. Returns midpoint prices
-    /// for all requested tokens, allowing efficient bulk price queries.
+    /// for all requested assets, allowing efficient bulk price queries.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or any token ID is invalid.
+    /// Returns an error if the request fails or any asset ID is invalid.
     pub async fn midpoints(&self, requests: &[MidpointRequest]) -> Result<MidpointsResponse> {
         let request = self
             .client()
@@ -934,14 +935,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves the current price for a market outcome token on a specific side.
+    /// Retrieves the current price for an exchange asset on a specific side.
     ///
     /// Returns the best available price for buying (BUY side) or selling (SELL side)
-    /// the specified token. This reflects the actual executable price on the orderbook.
+    /// the specified asset. This reflects the actual executable price on the orderbook.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn price(&self, request: &PriceRequest) -> Result<PriceResponse> {
         let params = request.query_params(None);
         let request = self
@@ -952,14 +953,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves prices for multiple market outcome tokens on their specific sides.
+    /// Retrieves prices for multiple exchange assets on their specific sides.
     ///
     /// This is the batch version of [`Self::price`]. Allows querying prices
-    /// for many tokens at once, with each request specifying its own side (BUY or SELL).
+    /// for many assets at once, with each request specifying its own side (BUY or SELL).
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or any token ID is invalid.
+    /// Returns an error if the request fails or any asset ID is invalid.
     pub async fn prices(&self, requests: &[PriceRequest]) -> Result<PricesResponse> {
         let request = self
             .client()
@@ -970,14 +971,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves historical price data for a market outcome token.
+    /// Retrieves historical price data for an exchange asset.
     ///
     /// Returns time-series price data over a specified time range or interval.
     /// The `fidelity` parameter controls the granularity of data points returned.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn price_history(
         &self,
         request: &PriceHistoryRequest,
@@ -991,7 +992,7 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, req.build()?, None).await
     }
 
-    /// Retrieves the bid-ask spread for a single market outcome token.
+    /// Retrieves the bid-ask spread for a single exchange asset.
     ///
     /// The spread is the difference between the best ask price and the best bid price,
     /// representing the cost of immediate execution. A smaller spread indicates higher
@@ -999,7 +1000,7 @@ impl<S: State> Client<S> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn spread(&self, request: &SpreadRequest) -> Result<SpreadResponse> {
         let params = request.query_params(None);
         let request = self
@@ -1010,14 +1011,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves bid-ask spreads for multiple market outcome tokens.
+    /// Retrieves bid-ask spreads for multiple exchange assets.
     ///
     /// This is the batch version of [`Self::spread`], allowing efficient
-    /// retrieval of spread data for many tokens simultaneously.
+    /// retrieval of spread data for many assets simultaneously.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or any token ID is invalid.
+    /// Returns an error if the request fails or any asset ID is invalid.
     pub async fn spreads(&self, requests: &[SpreadRequest]) -> Result<SpreadsResponse> {
         let request = self
             .client()
@@ -1028,21 +1029,21 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves the minimum tick size for a market outcome token.
+    /// Retrieves the minimum tick size for a CTF token or Polymarket V2 position.
     ///
-    /// The tick size defines the minimum price increment for orders on this token.
+    /// The tick size defines the minimum price increment for orders on this asset.
     /// Results are cached internally to reduce API calls. For example, a tick size
     /// of 0.01 means prices must be in increments of $0.01.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the token ID is invalid.
-    pub async fn tick_size(&self, token_id: U256) -> Result<TickSizeResponse> {
+    pub async fn tick_size(&self, asset_id: U256) -> Result<TickSizeResponse> {
         let revision = {
             let revision = self.metadata_read()?;
-            if let Some(tick_size) = self.inner.tick_sizes.get(&token_id) {
+            if let Some(tick_size) = self.inner.tick_sizes.get(&asset_id) {
                 #[cfg(feature = "tracing")]
-                tracing::trace!(token_id = %token_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
+                tracing::trace!(asset_id = %asset_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
                 return Ok(TickSizeResponse {
                     minimum_tick_size: *tick_size,
                 });
@@ -1051,28 +1052,28 @@ impl<S: State> Client<S> {
         };
 
         #[cfg(feature = "tracing")]
-        tracing::trace!(token_id = %token_id, "cache miss: tick_size");
+        tracing::trace!(asset_id = %asset_id, "cache miss: tick_size");
 
         let request = self
             .client()
             .request(Method::GET, format!("{}tick-size", self.host()))
-            .query(&[("token_id", token_id.to_string())])
+            .query(&[("token_id", asset_id.to_string())])
             .build()?;
 
         let response =
             crate::request::<TickSizeResponse>(&self.inner.client, request, None).await?;
         let _guard = self.inner.metadata_state.check(&revision)?;
-        if let Some(cached) = self.inner.tick_sizes.get(&token_id) {
+        if let Some(cached) = self.inner.tick_sizes.get(&asset_id) {
             return Ok(TickSizeResponse {
                 minimum_tick_size: *cached,
             });
         }
         self.inner
             .tick_sizes
-            .insert(token_id, response.minimum_tick_size);
+            .insert(asset_id, response.minimum_tick_size);
 
         #[cfg(feature = "tracing")]
-        tracing::trace!(token_id = %token_id, "cached tick_size");
+        tracing::trace!(asset_id = %asset_id, "cached tick_size");
 
         Ok(response)
     }
@@ -1085,7 +1086,7 @@ impl<S: State> Client<S> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn neg_risk(&self, token_id: U256) -> Result<NegRiskResponse> {
         let revision = {
             let revision = self.metadata_read()?;
@@ -1121,43 +1122,43 @@ impl<S: State> Client<S> {
         Ok(response)
     }
 
-    /// Retrieves the trading fee rate for a market outcome token.
+    /// Retrieves the trading fee rate for a CTF token or Polymarket V2 position.
     ///
-    /// Returns the fee rate in basis points (bps) charged on trades for this token.
+    /// Returns the fee rate in basis points (bps) charged on trades for this asset.
     /// For example, 10 bps = 0.10% fee. Results are cached internally to reduce API calls.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the token ID is invalid.
-    pub async fn fee_rate_bps(&self, token_id: U256) -> Result<FeeRateResponse> {
+    pub async fn fee_rate_bps(&self, asset_id: U256) -> Result<FeeRateResponse> {
         let revision = {
             let revision = self.metadata_read()?;
-            if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
+            if let Some(cached) = self.inner.fee_rate_bps.get(&asset_id) {
                 #[cfg(feature = "tracing")]
-                tracing::trace!(token_id = %token_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
+                tracing::trace!(asset_id = %asset_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
                 return Ok(cached.clone());
             }
             revision.clone()
         };
 
         #[cfg(feature = "tracing")]
-        tracing::trace!(token_id = %token_id, "cache miss: fee_rate_bps");
+        tracing::trace!(asset_id = %asset_id, "cache miss: fee_rate_bps");
 
         let request = self
             .client()
             .request(Method::GET, format!("{}fee-rate", self.host()))
-            .query(&[("token_id", token_id.to_string())])
+            .query(&[("token_id", asset_id.to_string())])
             .build()?;
 
         let response = crate::request::<FeeRateResponse>(&self.inner.client, request, None).await?;
         let _guard = self.inner.metadata_state.check(&revision)?;
-        if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
+        if let Some(cached) = self.inner.fee_rate_bps.get(&asset_id) {
             return Ok(cached.clone());
         }
-        self.inner.fee_rate_bps.insert(token_id, response.clone());
+        self.inner.fee_rate_bps.insert(asset_id, response.clone());
 
         #[cfg(feature = "tracing")]
-        tracing::trace!(token_id = %token_id, "cached fee_rate_bps");
+        tracing::trace!(asset_id = %asset_id, "cached fee_rate_bps");
 
         Ok(response)
     }
@@ -1187,14 +1188,14 @@ impl<S: State> Client<S> {
         Ok(market_fee)
     }
 
-    /// Returns the V2 platform-fee exponent (`fd.e`) for `token_id`. Defaults to `0` on
+    /// Returns the V2/V3 platform-fee exponent (`fd.e`) for `asset_id`. Defaults to `0` on
     /// legacy or fee-free markets.
     ///
     /// # Errors
     ///
     /// Returns an error if market metadata cannot be resolved.
-    pub async fn fee_exponent(&self, token_id: U256) -> Result<u32> {
-        Ok(self.fee_info(token_id).await?.exponent)
+    pub async fn fee_exponent(&self, asset_id: U256) -> Result<u32> {
+        Ok(self.fee_info(asset_id).await?.exponent)
     }
 
     /// Checks if the current IP address is geoblocked from accessing Polymarket.
@@ -1253,7 +1254,7 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves the full orderbook for a market outcome token.
+    /// Retrieves the full orderbook for a CTF token or Polymarket V2 position.
     ///
     /// Returns all active bids and asks at various price levels, showing
     /// the depth of liquidity available in the market. This includes the
@@ -1261,7 +1262,7 @@ impl<S: State> Client<S> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn order_book(
         &self,
         request: &OrderBookSummaryRequest,
@@ -1275,14 +1276,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves orderbooks for multiple market outcome tokens.
+    /// Retrieves orderbooks for multiple CTF tokens or Polymarket V2 positions.
     ///
     /// This is the batch version of [`Self::order_book`], allowing efficient
-    /// retrieval of orderbook data for many tokens in a single request.
+    /// retrieval of orderbook data for many assets in a single request.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or any token ID is invalid.
+    /// Returns an error if the request fails or any asset ID is invalid.
     pub async fn order_books(
         &self,
         requests: &[OrderBookSummaryRequest],
@@ -1305,14 +1306,14 @@ impl<S: State> Client<S> {
         book.hash()
     }
 
-    /// Retrieves the price of the most recent trade for a market outcome token.
+    /// Retrieves the most recent trade price for a CTF token or Polymarket V2 position.
     ///
     /// Returns the last executed trade price, which represents the most recent
     /// market consensus price. This is useful for tracking real-time price movements.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
+    /// Returns an error if the request fails or the asset ID is invalid.
     pub async fn last_trade_price(
         &self,
         request: &LastTradePriceRequest,
@@ -1329,14 +1330,14 @@ impl<S: State> Client<S> {
         crate::request(&self.inner.client, request, None).await
     }
 
-    /// Retrieves the last trade prices for multiple market outcome tokens.
+    /// Retrieves the last trade prices for multiple CTF tokens or Polymarket V2 positions.
     ///
     /// This is the batch version of [`Self::last_trade_price`], returning
     /// the most recent executed trade price for each requested token.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or any token ID is invalid.
+    /// Returns an error if the request fails or any asset ID is invalid.
     pub async fn last_trades_prices(
         &self,
         token_ids: &[LastTradePriceRequest],
@@ -1573,7 +1574,7 @@ impl<S: State> Client<S> {
         Ok((response, guard.clone()))
     }
 
-    /// Primes the tick-size, neg-risk, and fee caches for `token_id` from
+    /// Primes the tick-size, neg-risk, and fee caches for `asset_id` from
     /// `/clob-markets/{id}`, resolving the condition via `/markets-by-token` if needed.
     ///
     /// # Errors
@@ -1619,32 +1620,34 @@ impl<S: State> Client<S> {
         Ok(committed)
     }
 
-    /// Returns V2 fee parameters for `token_id`, priming the cache as needed.
+    /// Returns V2/V3 fee parameters for `asset_id`, priming the cache as needed.
     ///
     /// # Errors
     ///
     /// Returns an error if market metadata cannot be resolved.
-    pub(crate) async fn fee_info(&self, token_id: U256) -> Result<FeeInfo> {
-        let revision = self.ensure_market_info_cached(token_id).await?;
+    pub(crate) async fn fee_info(&self, asset_id: U256) -> Result<FeeInfo> {
+        let revision = self.ensure_market_info_cached(asset_id).await?;
         let _guard = self.inner.metadata_state.check(&revision)?;
         self.inner
             .fee_infos
-            .get(&token_id)
+            .get(&asset_id)
             .map(|e| *e)
             .ok_or_else(|| MetadataError::Unavailable.into())
     }
 
-    /// Looks up a market by token ID.
+    /// Looks up a market by CTF token ID or Polymarket V2 position ID.
+    ///
+    /// The endpoint retains its protocol-defined `markets-by-token` name for both asset kinds.
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or the token ID is invalid.
-    pub async fn market_by_token(&self, token_id: U256) -> Result<MarketByTokenResponse> {
+    /// Returns an error if the request fails or the asset ID is invalid.
+    pub async fn market_by_token(&self, asset_id: U256) -> Result<MarketByTokenResponse> {
         let request = self
             .client()
             .request(
                 Method::GET,
-                format!("{}markets-by-token/{token_id}", self.host()),
+                format!("{}markets-by-token/{asset_id}", self.host()),
             )
             .build()?;
 
@@ -2006,8 +2009,9 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Signs the provided [`SignableOrder`] using EIP-712 typed data signing.
     ///
     /// The EIP-712 domain and verifying contract are selected from the order's version:
-    /// V2 orders sign against `exchange_v2` with domain version `"2"`; V1 orders sign
-    /// against the legacy `exchange` (or neg-risk variant) with domain version `"1"`.
+    /// V3 position orders sign against `exchange_v3` with domain version `"3"`; V2 token orders
+    /// sign against `exchange_v2` with domain version `"2"`; V1 token orders sign against the
+    /// legacy `exchange` (or neg-risk variant) with domain version `"1"`.
     #[expect(
         clippy::missing_panics_doc,
         reason = "No need to publicly document as we are guarded by the typestate pattern. \
@@ -2030,7 +2034,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         let domain = self.order_signing_domain(chain_id, &payload).await?;
 
         let signature = match &payload {
-            OrderPayload::V2(p) => {
+            OrderPayload::V2(p) | OrderPayload::V3(p) => {
                 if p.order.signatureType == SignatureType::Poly1271 as u8 {
                     self.sign_poly1271_order(signer, &p.order, &domain, chain_id)
                         .await?
@@ -2072,11 +2076,11 @@ impl<K: Kind> Client<Authenticated<K>> {
         chain_id: u64,
         payload: &OrderPayload,
     ) -> Result<Eip712Domain> {
-        let token_id = match payload {
-            OrderPayload::V1(p) => p.order.tokenId,
-            OrderPayload::V2(p) => p.order.tokenId,
+        let neg_risk = match payload {
+            OrderPayload::V1(p) => self.neg_risk(p.order.tokenId).await?.neg_risk,
+            OrderPayload::V2(p) => self.neg_risk(p.order.tokenId).await?.neg_risk,
+            OrderPayload::V3(_) => false,
         };
-        let neg_risk = self.neg_risk(token_id).await?.neg_risk;
         let config = contract_config(chain_id, neg_risk)
             .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
         let domain = match payload {
@@ -2094,6 +2098,15 @@ impl<K: Kind> Client<Authenticated<K>> {
                     ..Eip712Domain::default()
                 }
             }
+            OrderPayload::V3(_) => Eip712Domain {
+                name: ORDER_NAME,
+                version: VERSION_V3,
+                chain_id: Some(U256::from(chain_id)),
+                verifying_contract: Some(config.exchange_v3.ok_or_else(|| {
+                    Error::validation(format!("No V3 exchange contract configured for chain_id={chain_id}"))
+                })?),
+                ..Eip712Domain::default()
+            },
             OrderPayload::V1(_) => Eip712Domain {
                 name: ORDER_NAME,
                 version: VERSION_V1,
@@ -2127,7 +2140,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             .expect("Validated not none in `authenticate`");
         let domain = self.order_signing_domain(chain_id, payload).await?;
         Ok(match payload {
-            OrderPayload::V2(p) => p.order.eip712_signing_hash(&domain),
+            OrderPayload::V2(p) | OrderPayload::V3(p) => p.order.eip712_signing_hash(&domain),
             OrderPayload::V1(p) => p.order.eip712_signing_hash(&domain),
         })
     }
@@ -3290,6 +3303,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             funder: self.inner.funder,
             salt_generator: self.inner.salt_generator,
             token_id: None,
+            position_id: None,
             price: None,
             size: None,
             amount: None,
