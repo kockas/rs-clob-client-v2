@@ -346,10 +346,7 @@ impl SubscriptionManager {
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Subscription lagged, missed {n} messages — continuing");
+                        Err(WsError::Lagged { missed: n })?;
                     }
                     Err(RecvError::Closed) => {
                         break;
@@ -433,10 +430,7 @@ impl SubscriptionManager {
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Subscription lagged, missed {n} messages — continuing");
+                        Err(WsError::Lagged { missed: n })?;
                     }
                     Err(RecvError::Closed) => {
                         break;

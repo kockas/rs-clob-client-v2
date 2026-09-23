@@ -2,8 +2,6 @@ use bon::Builder;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_with::{DefaultOnNull, DisplayFromStr, NoneAsEmptyString, serde_as};
-#[cfg(feature = "tracing")]
-use tracing::warn;
 
 use crate::auth::ApiKey;
 use crate::clob::types::{OrderStatusType, Side, TraderSide};
@@ -490,8 +488,8 @@ pub struct MidpointUpdate {
 /// extracted to check interest before final deserialization via `from_value()`.
 /// This avoids re-parsing the JSON text twice.
 ///
-/// For arrays, messages are processed one-by-one with tolerant parsing: unknown or invalid
-/// event types are skipped rather than causing the entire batch to fail.
+/// Unknown/unsubscribed event types are ignored. Malformed subscribed evidence
+/// fails the batch so connection health can report a gap instead of hiding it.
 pub fn parse_if_interested(
     bytes: &[u8],
     interest: &MessageInterest,
@@ -515,7 +513,7 @@ pub fn parse_if_interested(
                 }
             }
         }
-        Value::Array(arr) => Ok(arr
+        Value::Array(arr) => arr
             .iter()
             .filter_map(|elem| {
                 let obj = elem.as_object()?;
@@ -525,18 +523,9 @@ pub fn parse_if_interested(
                     return None;
                 }
 
-                serde_json::from_value(elem.clone())
-                    .inspect_err(|err| {
-                        #[cfg(feature = "tracing")]
-                        warn!(
-                            event_type = %event_type,
-                            error = %err,
-                            "Skipping unknown/invalid WS event in batch"
-                        );
-                    })
-                    .ok()
+                Some(serde_json::from_value(elem.clone()).map_err(crate::error::Error::from))
             })
-            .collect()),
+            .collect(),
         _ => Ok(vec![]),
     }
 }

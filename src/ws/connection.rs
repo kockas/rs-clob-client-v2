@@ -3,9 +3,11 @@
     reason = "Connection types expose their domain in the name for clarity"
 )]
 
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use backoff::backoff::Backoff as _;
@@ -29,7 +31,25 @@ use crate::{Result, error::Error};
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Broadcast channel capacity for incoming messages.
-const BROADCAST_CAPACITY: usize = 1024;
+pub const BROADCAST_CAPACITY: usize = 8192;
+
+/// Out-of-band evidence health. Faults are sticky for this manager's lifetime:
+/// a later reconnect or good frame cannot erase an earlier loss.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionHealth {
+    pub faults: u64,
+    pub messages: u64,
+    pub pending: usize,
+    pub oldest_pending_age: std::time::Duration,
+    pub last_message_age: Option<std::time::Duration>,
+}
+
+#[derive(Default)]
+struct Evidence {
+    faults: u64,
+    messages: u64,
+    receipts: VecDeque<Instant>,
+}
 
 /// Connection state tracking.
 #[non_exhaustive]
@@ -102,6 +122,7 @@ where
     sender_tx: mpsc::UnboundedSender<String>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
+    evidence: Arc<Mutex<Evidence>>,
     /// Aborts the spawned connection-loop task when the last `ConnectionManager`
     /// clone is dropped. Without this, the task holds `state_tx` and
     /// `sender_tx` indefinitely and reconnects forever even after every
@@ -136,6 +157,8 @@ where
         let (sender_tx, sender_rx) = mpsc::unbounded_channel();
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
+        let evidence = Arc::new(Mutex::new(Evidence::default()));
+        let evidence_task = evidence.clone();
 
         // Spawn connection task
         let connection_config = config;
@@ -151,6 +174,7 @@ where
                 broadcast_tx_clone,
                 parser,
                 state_tx_clone,
+                evidence_task,
             )
             .await;
         });
@@ -160,6 +184,7 @@ where
             state_rx,
             sender_tx,
             broadcast_tx,
+            evidence,
             _task_guard: Arc::new(AbortOnDropHandle(handle)),
             _phantom: PhantomData,
         })
@@ -173,6 +198,7 @@ where
         broadcast_tx: broadcast::Sender<M>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
+        evidence: Arc<Mutex<Evidence>>,
     ) {
         let mut attempt = 0_u32;
         let mut backoff: backoff::ExponentialBackoff = config.reconnect.clone().into();
@@ -207,6 +233,7 @@ where
                         state_rx,
                         config.clone(),
                         &parser,
+                        &evidence,
                     )
                     .await
                     {
@@ -227,6 +254,10 @@ where
             }
 
             // Check if we should stop reconnecting
+            evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .faults += 1;
             if let Some(max) = config.reconnect.max_attempts
                 && attempt >= max
             {
@@ -251,6 +282,7 @@ where
         state_rx: watch::Receiver<ConnectionState>,
         config: Config,
         parser: &P,
+        evidence: &Mutex<Evidence>,
     ) -> Result<()> {
         let (mut write, mut read) = ws_stream.split();
 
@@ -265,7 +297,8 @@ where
         loop {
             tokio::select! {
                 // Handle incoming messages
-                Some(msg) = read.next() => {
+                incoming = read.next() => {
+                    let Some(msg) = incoming else { break; };
                     match msg {
                         Ok(Message::Text(text)) if text == "PONG" => {
                             _ = pong_tx.send(Instant::now());
@@ -280,10 +313,22 @@ where
                                     for message in messages {
                                         #[cfg(feature = "tracing")]
                                         tracing::trace!(?message, "Parsed WebSocket message");
+                                        let mut health = evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        // Detect overflow at publication, not when the stalled
+                                        // subscription finally gets polled again.
+                                        if broadcast_tx.len() >= BROADCAST_CAPACITY {
+                                            health.faults += 1;
+                                        }
+                                        if health.receipts.len() == BROADCAST_CAPACITY {
+                                            health.receipts.pop_front();
+                                        }
+                                        health.receipts.push_back(Instant::now());
+                                        health.messages += 1;
                                         _ = broadcast_tx.send(message);
                                     }
                                 }
                                 Err(e) => {
+                                    evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner).faults += 1;
                                     #[cfg(feature = "tracing")]
                                     tracing::warn!(%text, error = %e, "Failed to parse WebSocket message");
                                     #[cfg(not(feature = "tracing"))]
@@ -319,7 +364,10 @@ where
                 }
 
                 // Handle PING requests from heartbeat loop
-                Some(()) = ping_rx.recv() => {
+                ping = ping_rx.recv() => {
+                    // Heartbeat timeout must end the socket session, not leave
+                    // the reader alive forever with a dead heartbeat task.
+                    if ping.is_none() { break; }
                     if write.send(Message::Text("PING".into())).await.is_err() {
                         break;
                     }
@@ -423,6 +471,31 @@ where
     #[must_use]
     pub fn state(&self) -> ConnectionState {
         *self.state_rx.borrow()
+    }
+
+    /// Inspect loss and queue age independently of the data receiver.
+    #[must_use]
+    pub fn health(&self) -> ConnectionHealth {
+        let health = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending = self.broadcast_tx.len();
+        let oldest = health.receipts.len().saturating_sub(pending);
+        ConnectionHealth {
+            faults: health.faults,
+            messages: health.messages,
+            pending,
+            oldest_pending_age: if pending == 0 {
+                std::time::Duration::ZERO
+            } else {
+                health
+                    .receipts
+                    .get(oldest)
+                    .map_or(std::time::Duration::ZERO, Instant::elapsed)
+            },
+            last_message_age: health.receipts.back().map(Instant::elapsed),
+        }
     }
 
     /// Subscribe to incoming messages.

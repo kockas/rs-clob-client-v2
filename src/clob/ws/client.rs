@@ -370,6 +370,25 @@ impl<S: State> Client<S> {
         )
     }
 
+    /// Loss/queue-age telemetry outside the potentially stalled event stream.
+    #[must_use]
+    pub fn connection_health(
+        &self,
+        channel: ChannelType,
+    ) -> Option<crate::ws::connection::ConnectionHealth> {
+        self.inner.channel(channel).map(|c| c.connection.health())
+    }
+
+    /// One receiver for all market evidence, preserving wire order across books,
+    /// deltas and prints. Typed views remain available for other clients.
+    pub fn subscribe_market_events(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<WsMessage>> + use<S>> {
+        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
+        resources.subscriptions.subscribe_market(asset_ids)
+    }
+
     /// Check if the WebSocket connection is established for a specific channel.
     ///
     /// Returns `false` if no subscriptions have been made yet for this channel.
