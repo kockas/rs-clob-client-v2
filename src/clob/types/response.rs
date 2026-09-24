@@ -317,6 +317,7 @@ pub struct PostOrderResponse {
     #[builder(default)]
     #[serde(default)]
     #[serde_as(deserialize_as = "DefaultOnNull")]
+    #[serde(alias = "tradeIDs")]
     pub trade_ids: Vec<String>,
 }
 
