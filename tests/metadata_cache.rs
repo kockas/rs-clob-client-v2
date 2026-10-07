@@ -171,6 +171,7 @@ impl Server {
                                     ("GET", p) if p.starts_with("/clob-markets/") => Reply::ok(bulk("0.01", false, &[TOKEN, OTHER], Some("0.07"))),
                                     ("GET", p) if p.starts_with("/fees/builder-fees/") => Reply::ok(json!({"builderMakerFeeRateBps":0,"builderTakerFeeRateBps":10})),
                                     ("POST", "/order") => Reply { status:400, body:json!({"error":"order_version_mismatch"}).to_string(), gate:None },
+                                    ("POST", "/v1/heartbeats") => Reply::ok(json!({"heartbeat_id":uuid::Uuid::nil()})),
                                     _ => panic!("unexpected offline request: {key}"),
                                 }
                             });
@@ -307,6 +308,29 @@ enum Field {
     Version,
 }
 impl Field {
+    async fn read_view(
+        self,
+        view: &polymarket_client_sdk_v2::clob::metadata_view::MetadataView<Authenticated<Normal>>,
+    ) -> polymarket_client_sdk_v2::Result<()> {
+        match self {
+            Self::Tick => {
+                view.tick_size(U256::from(TOKEN)).await?;
+            }
+            Self::Neg => {
+                view.neg_risk(U256::from(TOKEN)).await?;
+            }
+            Self::Fee => {
+                view.fee_rate_bps(U256::from(TOKEN)).await?;
+            }
+            Self::Builder => {
+                view.builder_fee_rate(alloy::primitives::B256::ZERO).await?;
+            }
+            Self::Version => {
+                view.version().await?;
+            }
+        }
+        Ok(())
+    }
     fn path(self) -> String {
         match self {
             Self::Tick => "/tick-size?token_id=123".into(),
@@ -895,4 +919,326 @@ async fn same_complete_payload_signatures_and_hashes_stay_exact_for_all_domains_
             assert!(warmed.metadata_is_current(&revision));
         }
     }
+}
+
+#[tokio::test]
+async fn bound_delayed_first_poll_and_cache_hits_never_adopt_new_revision() {
+    for warmed in [false, true] {
+        for field in FIELDS {
+            let server = Server::new(2, false).await;
+            let sdk = client(&server).await;
+            if warmed {
+                field.read(&sdk).await.unwrap();
+            }
+            let revision = sdk.metadata_revision().unwrap();
+            let view = sdk.metadata_view(&revision).unwrap();
+            let clone = view.clone();
+            let pending = field.read_view(&clone); // Deliberately not polled.
+            sdk.invalidate_internal_caches();
+            // Include a current cache hit: an old view cannot borrow its value.
+            if warmed {
+                field.read(&sdk).await.unwrap();
+            }
+            let count = server.seen().len();
+            changed(pending.await);
+            changed(view.metadata_revision());
+            changed(sdk.metadata_view(&revision));
+            assert!(!view.metadata_is_current(&sdk.metadata_revision().unwrap()));
+            assert_eq!(server.seen().len(), count);
+            let current = sdk
+                .metadata_view(&sdk.metadata_revision().unwrap())
+                .unwrap();
+            field.read_view(&current).await.unwrap();
+            assert_eq!(server.seen().len(), count + usize::from(!warmed));
+        }
+    }
+}
+
+#[tokio::test]
+async fn bound_held_responses_cannot_repopulate_retired_cache() {
+    for field in [Field::Tick, Field::Neg, Field::Fee, Field::Builder] {
+        let server = Server::new(2, false).await;
+        let sdk = client(&server).await;
+        let view = sdk
+            .metadata_view(&sdk.metadata_revision().unwrap())
+            .unwrap();
+        let gate = Gate::new();
+        server.plan(&field.path(), Reply::held(field.reply(false), gate.clone()));
+        let mut old = Box::pin(field.read_view(&view));
+        enter!(old, gate);
+        sdk.invalidate_internal_caches();
+        server.plan(&field.path(), Reply::ok(field.reply(true)));
+        let canonical = field.read(&sdk).await.unwrap();
+        gate.release();
+        changed(old.await);
+        assert_eq!(field.read(&sdk).await.unwrap(), canonical);
+        assert_eq!(server.seen().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn bound_builder_clones_and_sign_hash_reject_invalidation_between_steps() {
+    for version in [1, 2] {
+        let server = Server::new(version, false).await;
+        let sdk = client(&server).await;
+        let view = sdk
+            .metadata_view(&sdk.metadata_revision().unwrap())
+            .unwrap();
+        let builder = view
+            .limit_order()
+            .token_id(U256::from(TOKEN))
+            .side(Side::Buy)
+            .price(Decimal::new(4, 1))
+            .size(Decimal::new(5, 0))
+            .order_type(OrderType::FAK);
+        let clone = builder.clone();
+        let signable = builder.build().await.unwrap();
+        // Build's tick/version/(V1 fee) initialized under the same revision.
+        assert!(view.metadata_revision().is_ok());
+        sdk.invalidate_internal_caches();
+        let count = server.seen().len();
+        changed(clone.build().await);
+        changed(view.sign(&signer(), signable.clone()).await);
+        changed(view.order_signing_hash(&signer(), &signable.payload).await);
+        assert_eq!(
+            server.seen().len(),
+            count,
+            "no new negative-risk request from obsolete work"
+        );
+        let fresh = sdk
+            .metadata_view(&sdk.metadata_revision().unwrap())
+            .unwrap();
+        fresh.sign(&signer(), signable).await.unwrap();
+        assert_eq!(server.seen().len(), count + 1);
+    }
+}
+
+#[tokio::test]
+async fn bound_v2_fee_miss_requires_root_refresh_without_lookup_side_effects() {
+    let server = Server::new(2, false).await;
+    let sdk = client(&server).await;
+    let revision = sdk.metadata_revision().unwrap();
+    let view = sdk.metadata_view(&revision).unwrap();
+    assert_eq!(
+        view.fee_exponent(U256::from(TOKEN))
+            .await
+            .unwrap_err()
+            .downcast_ref::<MetadataError>(),
+        Some(&MetadataError::RefreshRequired)
+    );
+    server.assert_seen(&[]);
+    assert!(sdk.metadata_is_current(&revision));
+    // The regular market builder must preserve the bound view too.
+    let error = view
+        .market_order()
+        .token_id(U256::from(TOKEN))
+        .side(Side::Buy)
+        .price(Decimal::new(4, 1))
+        .amount(Amount::usdc(Decimal::new(2, 0)).unwrap())
+        .user_usdc_balance(Decimal::new(2, 0))
+        .build()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<MetadataError>(),
+        Some(&MetadataError::RefreshRequired)
+    );
+    assert!(
+        !server
+            .seen()
+            .iter()
+            .any(|r| r.contains("markets-by-token") || r.contains("clob-markets"))
+    );
+    sdk.clob_market_info(CONDITION).await.unwrap();
+    changed(view.fee_exponent(U256::from(TOKEN)).await);
+    let fresh = sdk
+        .metadata_view(&sdk.metadata_revision().unwrap())
+        .unwrap();
+    let count = server.seen().len();
+    assert_eq!(fresh.fee_exponent(U256::from(TOKEN)).await.unwrap(), 1);
+    assert_eq!(server.seen().len(), count);
+}
+
+#[tokio::test]
+async fn bound_convenience_methods_reject_before_any_io_or_refresh() {
+    let server = Server::new(2, false).await;
+    let sdk = client(&server).await;
+    let revision = sdk.metadata_revision().unwrap();
+    let view = sdk.metadata_view(&revision).unwrap();
+    for error in [
+        view.limit_order()
+            .build_sign_and_post(&signer())
+            .await
+            .unwrap_err(),
+        view.market_order()
+            .build_sign_and_post(&signer())
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(
+            error.downcast_ref::<MetadataError>(),
+            Some(&MetadataError::PreparationOnly)
+        );
+    }
+    assert!(sdk.metadata_is_current(&revision));
+    server.assert_seen(&[]);
+}
+
+#[tokio::test]
+async fn bound_and_unbound_sign_complete_payload_identically() {
+    for version in [1, 2] {
+        for neg in [false, true] {
+            let server = Server::new(version, neg).await;
+            let sdk = client(&server).await;
+            let view = sdk
+                .metadata_view(&sdk.metadata_revision().unwrap())
+                .unwrap();
+            let payload = view
+                .limit_order()
+                .token_id(U256::from(TOKEN))
+                .side(Side::Buy)
+                .price(Decimal::new(4, 1))
+                .size(Decimal::new(5, 0))
+                .order_type(OrderType::FAK)
+                .nonce(42)
+                .build()
+                .await
+                .unwrap();
+            let a = view.sign(&signer(), payload.clone()).await.unwrap();
+            let b = sdk.sign(&signer(), payload).await.unwrap();
+            assert_eq!(a, b);
+            assert_eq!(
+                view.order_signing_hash(&signer(), &a.payload)
+                    .await
+                    .unwrap(),
+                sdk.order_signing_hash(&signer(), &b.payload).await.unwrap()
+            );
+            let count = server.seen().len();
+            view.tick_size(U256::from(TOKEN)).await.unwrap();
+            assert_eq!(server.seen().len(), count);
+            let _ = sdk.post_order(a).await; // Root POST remains available; mismatch refresh stays legacy.
+            assert_eq!(
+                server
+                    .seen()
+                    .iter()
+                    .filter(|r| r.starts_with("POST "))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bound_view_and_its_futures_are_send() {
+    fn send<T: Send>(_: T) {}
+    let server = Server::new(2, false).await;
+    let sdk = client(&server).await;
+    let view = sdk
+        .metadata_view(&sdk.metadata_revision().unwrap())
+        .unwrap();
+    send(view.clone());
+    send(view.version());
+    send(view.tick_size(U256::from(TOKEN)));
+    send(view.neg_risk(U256::from(TOKEN)));
+    send(view.fee_rate_bps(U256::from(TOKEN)));
+    send(view.fee_exponent(U256::from(TOKEN)));
+    send(view.limit_order().build());
+    server.assert_seen(&[]);
+}
+
+#[tokio::test]
+async fn bound_cached_read_microbenchmark() {
+    let server = Server::new(2, false).await;
+    let sdk = client(&server).await;
+    sdk.tick_size(U256::from(TOKEN)).await.unwrap();
+    let view = sdk
+        .metadata_view(&sdk.metadata_revision().unwrap())
+        .unwrap();
+    let iterations = 100_000;
+    let mut unbound_ns = Vec::new();
+    let mut bound_ns = Vec::new();
+    for round in 0..6 {
+        for use_view in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                let value = if use_view {
+                    view.tick_size(U256::from(TOKEN)).await
+                } else {
+                    sdk.tick_size(U256::from(TOKEN)).await
+                };
+                std::hint::black_box(value.unwrap());
+            }
+            let per_read = start.elapsed().as_nanos() / iterations;
+            if use_view {
+                bound_ns.push(per_read);
+            } else {
+                unbound_ns.push(per_read);
+            }
+        }
+    }
+    // Time is diagnostic only. Request counts, not performance thresholds,
+    // prove this is the cache-only path; release results are not live latency.
+    println!(
+        "metadata_cached_read_benchmark {}",
+        json!({"iterations_per_sample":iterations,"unbound_ns":unbound_ns,"bound_ns":bound_ns})
+    );
+    server.assert_seen(&["GET /tick-size?token_id=123"]);
+}
+
+#[cfg(feature = "heartbeats")]
+#[tokio::test]
+async fn dropping_bound_views_and_builders_does_not_cancel_root_heartbeats() {
+    let server = Server::new(2, false).await;
+    let mut sdk = Client::new(
+        &server.url,
+        Config::builder()
+            .heartbeat_interval(Duration::from_millis(20))
+            .build(),
+    )
+    .unwrap()
+    .authentication_builder(&signer())
+    .credentials(Credentials::new(
+        uuid::Uuid::nil(),
+        "dGVzdA==".into(),
+        "test".into(),
+    ))
+    .authenticate()
+    .await
+    .unwrap();
+    let count = || {
+        server
+            .seen()
+            .iter()
+            .filter(|r| r.as_str() == "POST /v1/heartbeats")
+            .count()
+    };
+    bounded(async {
+        while count() < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let view = sdk
+        .metadata_view(&sdk.metadata_revision().unwrap())
+        .unwrap();
+    drop(view.clone());
+    let builder = view.limit_order();
+    drop(builder.clone());
+    drop(builder);
+    drop(view.market_order());
+    drop(view);
+    let before = count();
+    bounded(async {
+        while count() < before + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(sdk.heartbeats_active());
+    sdk.stop_heartbeats().await.unwrap();
 }

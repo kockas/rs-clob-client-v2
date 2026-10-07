@@ -381,6 +381,7 @@ impl<K: AuthKind> OrderBuilder<Limit, K> {
     ///
     /// Returns an error if any of the build, sign, or post steps fails.
     pub async fn build_sign_and_post<S: Signer>(self, signer: &S) -> Result<PostOrderResponse> {
+        self.client.require_submission_client()?;
         let client = self.client.clone();
         let before_version = client.resolve_version(false).await.unwrap_or(0);
         let retry = self.clone();
@@ -634,6 +635,7 @@ impl<K: AuthKind> OrderBuilder<Market, K> {
     ///
     /// Returns an error if any of the build, sign, or post steps fails.
     pub async fn build_sign_and_post<S: Signer>(self, signer: &S) -> Result<PostOrderResponse> {
+        self.client.require_submission_client()?;
         let client = self.client.clone();
         let before_version = client.resolve_version(false).await.unwrap_or(0);
         let retry = self.clone();

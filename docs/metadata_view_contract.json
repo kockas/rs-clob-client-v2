@@ -1,0 +1,14 @@
+{
+  "schema": "clob_metadata_view_contract_v1",
+  "date": "2026-10-07",
+  "baseline": "6e785c758d0aa2b584065d4c4a85278bc0ec54ba",
+  "purpose": "Close the request-start-after-invalidation race in future background prewarm jobs and existing multi-step order preparation. Cache commit fencing alone could not prevent an obsolete invocation's next getter from starting under a new epoch.",
+  "api": "Client::metadata_view(&MetadataRevision) returns a private-inner immutable MetadataView sharing the original ClientInner, caches, HTTP pool and authentication. Construction and all getter cache reads/miss captures check the supplied revision under the metadata mutex. Cloned views and their builders retain it. No Deref or unrestricted client escape.",
+  "ordinary_sdk": "Unbound Client behavior is unchanged. This is opt-in; existing root getters, setters, bulk refreshes, authentication, POSTs and convenience retries retain their semantics. It does not retroactively bind ordinary builders.",
+  "mutation": "View offers no mutation, auth transition or submission. Bound V2 fee cache misses return RefreshRequired before dependent lookup HTTP or mapping changes. Bulk and forced-version refreshes defensively reject on internal bound clients. Root authority must refresh explicitly, then caller starts a new invocation, not an automatic order replay.",
+  "submission": "View exposes existing builders for preparation; both builder convenience POST paths reject PreparationOnly before I/O. Internal bound post_order/post_orders also reject. Root client remains sole submission owner and caller must retain its final unsent admission fence. An update after admission is not proof that a submitted order is unfilled.",
+  "lifetime": "Views have no heartbeat cancellation owner; dropping view or builder clones cannot cancel root heartbeats. They retain the shared HTTP/auth lifetime through Arc. No lock crosses an HTTP, authentication-header or signer await.",
+  "unchanged": ["signing domains and payloads", "nonce", "order arithmetic", "authentication headers", "HTTP pooling", "WebSocket behavior", "strategy", "simulation clocks"],
+  "tests": "tests/metadata_cache.rs: delayed first poll/cache hits, obsolete held responses, clone/build/sign/hash phases, V2 fee refresh requirement, convenience submission rejection, identical complete signatures and hashes, Send futures, heartbeat lifetime and diagnostic cache-hit microbenchmark. Existing revision/cache/auth/order regression suites retained.",
+  "limits": "This SDK change alone neither prewarms metadata nor changes the application's use of the SDK. It removes no demonstrated live HTTP waits until the separately reviewed application coordinator is implemented and activated. No historical timing-alignment or profitability claim."
+}

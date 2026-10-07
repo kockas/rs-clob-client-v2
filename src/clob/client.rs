@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::mem;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, MutexGuard};
 #[cfg(feature = "heartbeats")]
 use std::time::Duration;
 
@@ -29,6 +29,7 @@ use {tokio::sync::oneshot::Receiver, tokio::time, tokio_util::sync::Cancellation
 use crate::auth::state::{Authenticated, State, Unauthenticated};
 use crate::auth::{Credentials, Kind, Normal};
 use crate::clob::metadata::{MetadataError, MetadataRevision, MetadataState};
+use crate::clob::metadata_view::MetadataView;
 use crate::clob::order_builder::{Limit, Market, OrderBuilder, generate_seed};
 use crate::clob::types::request::{
     BalanceAllowanceRequest, CancelMarketOrderRequest, DeleteNotificationsRequest,
@@ -262,6 +263,7 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
             )
         )]
         let mut client = Client {
+            expected_metadata: None,
             inner: Arc::new(ClientInner {
                 state,
                 config: inner.config,
@@ -347,6 +349,8 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
 #[derive(Clone, Debug)]
 pub struct Client<S: State = Unauthenticated> {
     inner: Arc<ClientInner<S>>,
+    // Present only inside a preparation view and its builders. Never rebind.
+    expected_metadata: Option<MetadataRevision>,
     #[cfg(feature = "heartbeats")]
     /// When the `heartbeats` feature is enabled, the authenticated [`Client`] will automatically
     /// send heartbeats at the default cadence. See [`Config`] for more details.
@@ -639,14 +643,47 @@ impl<S: State> Client<S> {
     /// immediately before submitting an unsent request. This does not lock out
     /// subsequent venue changes or classify requests already sent.
     pub fn metadata_revision(&self) -> Result<MetadataRevision> {
-        Ok(self.inner.metadata_state.lock()?.clone())
+        Ok(self.metadata_read()?.clone())
+    }
+
+    /// Bind preparation to an already admitted revision. This shares the same
+    /// caches, HTTP pool and authentication; it cannot submit or refresh orders.
+    pub fn metadata_view(&self, revision: &MetadataRevision) -> Result<MetadataView<S>> {
+        let guard = self.metadata_read()?;
+        if *guard != *revision {
+            return Err(MetadataError::Changed.into());
+        }
+        Ok(MetadataView {
+            client: Client {
+                inner: Arc::clone(&self.inner),
+                expected_metadata: Some(revision.clone()),
+                // A preparation view is not a heartbeat lifetime owner.
+                #[cfg(feature = "heartbeats")]
+                heartbeat_token: DroppingCancellationToken(None),
+            },
+        })
+    }
+
+    fn metadata_read(&self) -> Result<MutexGuard<'_, MetadataRevision>> {
+        match &self.expected_metadata {
+            Some(revision) => self.inner.metadata_state.check(revision),
+            None => self.inner.metadata_state.lock(),
+        }
+    }
+
+    pub(crate) fn require_submission_client(&self) -> Result<()> {
+        if self.expected_metadata.is_some() {
+            return Err(MetadataError::PreparationOnly.into());
+        }
+        Ok(())
     }
 
     /// Whether the revision belongs to this client's current cache state.
     /// Fails closed on poisoning. Initial single-field fills keep the revision;
     /// setters, invalidation, bulk refresh and forced version refresh change it.
     pub fn metadata_is_current(&self, revision: &MetadataRevision) -> bool {
-        self.inner.metadata_state.check(revision).is_ok()
+        self.metadata_read()
+            .is_ok_and(|current| *current == *revision)
     }
 
     /// Pre-populates the tick size cache for a token, avoiding the HTTP call.
@@ -779,8 +816,11 @@ impl<S: State> Client<S> {
         }
 
         let revision = {
-            let mut revision = self.inner.metadata_state.lock()?;
+            let mut revision = self.metadata_read()?;
             if force {
+                if self.expected_metadata.is_some() {
+                    return Err(MetadataError::RefreshRequired.into());
+                }
                 *revision = MetadataRevision::default();
                 self.inner.cached_version.store(0, Ordering::Relaxed);
             }
@@ -949,7 +989,7 @@ impl<S: State> Client<S> {
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn tick_size(&self, token_id: U256) -> Result<TickSizeResponse> {
         let revision = {
-            let revision = self.inner.metadata_state.lock()?;
+            let revision = self.metadata_read()?;
             if let Some(tick_size) = self.inner.tick_sizes.get(&token_id) {
                 #[cfg(feature = "tracing")]
                 tracing::trace!(token_id = %token_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
@@ -998,7 +1038,7 @@ impl<S: State> Client<S> {
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn neg_risk(&self, token_id: U256) -> Result<NegRiskResponse> {
         let revision = {
-            let revision = self.inner.metadata_state.lock()?;
+            let revision = self.metadata_read()?;
             if let Some(neg_risk) = self.inner.neg_risk.get(&token_id) {
                 #[cfg(feature = "tracing")]
                 tracing::trace!(token_id = %token_id, neg_risk = *neg_risk, "cache hit: neg_risk");
@@ -1041,7 +1081,7 @@ impl<S: State> Client<S> {
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn fee_rate_bps(&self, token_id: U256) -> Result<FeeRateResponse> {
         let revision = {
-            let revision = self.inner.metadata_state.lock()?;
+            let revision = self.metadata_read()?;
             if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
                 #[cfg(feature = "tracing")]
                 tracing::trace!(token_id = %token_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
@@ -1428,6 +1468,10 @@ impl<S: State> Client<S> {
         required_token: Option<U256>,
         revision: &MetadataRevision,
     ) -> Result<(ClobMarketInfoResponse, MetadataRevision)> {
+        if self.expected_metadata.is_some() {
+            drop(self.metadata_read()?);
+            return Err(MetadataError::RefreshRequired.into());
+        }
         let required_condition: B256 = condition_id
             .parse()
             .map_err(|_| Error::validation("invalid metadata condition identity"))?;
@@ -1490,9 +1534,12 @@ impl<S: State> Client<S> {
         token_id: U256,
     ) -> Result<MetadataRevision> {
         let (revision, cached_condition) = {
-            let revision = self.inner.metadata_state.lock()?;
+            let revision = self.metadata_read()?;
             if self.inner.fee_infos.contains_key(&token_id) {
                 return Ok(revision.clone());
+            }
+            if self.expected_metadata.is_some() {
+                return Err(MetadataError::RefreshRequired.into());
             }
             (
                 revision.clone(),
@@ -1647,6 +1694,7 @@ impl Client<Unauthenticated> {
         )?;
 
         Ok(Self {
+            expected_metadata: None,
             inner: Arc::new(ClientInner {
                 config,
                 host: Url::parse(host)?,
@@ -1763,6 +1811,7 @@ impl<K: Kind> Client<Authenticated<K>> {
         let inner = Arc::into_inner(self.inner).ok_or(Synchronization)?;
 
         Ok(Client::<Unauthenticated> {
+            expected_metadata: None,
             inner: Arc::new(ClientInner {
                 state: Unauthenticated,
                 host: inner.host,
@@ -2066,6 +2115,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// - The order price/size violates market rules
     /// - The request fails
     pub async fn post_order(&self, order: SignedOrder) -> Result<PostOrderResponse> {
+        self.require_submission_client()?;
         let request = self
             .client()
             .request(Method::POST, format!("{}order", self.host()))
@@ -2088,6 +2138,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     ///
     /// Returns an error if any order fails validation or the request fails.
     pub async fn post_orders(&self, orders: Vec<SignedOrder>) -> Result<Vec<PostOrderResponse>> {
+        self.require_submission_client()?;
         let request = self
             .client()
             .request(Method::POST, format!("{}orders", self.host()))
@@ -2668,7 +2719,7 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// Returns an error if the request fails.
     pub async fn builder_fee_rate(&self, builder_code: B256) -> Result<BuilderFeeRateResponse> {
         let revision = {
-            let revision = self.inner.metadata_state.lock()?;
+            let revision = self.metadata_read()?;
             if let Some(cached) = self.inner.builder_fee_rates.get(&builder_code) {
                 return Ok(cached.clone());
             }
@@ -3130,6 +3181,7 @@ impl<K: Kind> Client<Authenticated<K>> {
             fee_rate_bps: None,
             client: Client {
                 inner: Arc::clone(&self.inner),
+                expected_metadata: self.expected_metadata.clone(),
                 #[cfg(feature = "heartbeats")]
                 heartbeat_token: self.heartbeat_token.clone(),
             },

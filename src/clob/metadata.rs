@@ -32,6 +32,8 @@ pub enum MetadataError {
     Changed,
     Unavailable,
     Poisoned,
+    RefreshRequired,
+    PreparationOnly,
 }
 impl fmt::Display for MetadataError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -39,6 +41,12 @@ impl fmt::Display for MetadataError {
             Self::Changed => "order metadata changed while request was pending",
             Self::Unavailable => "requested order metadata is unavailable",
             Self::Poisoned => "order metadata synchronization is poisoned",
+            Self::RefreshRequired => {
+                "metadata requires an authoritative refresh before preparation"
+            }
+            Self::PreparationOnly => {
+                "metadata view is preparation-only; submit through the root client"
+            }
         })
     }
 }

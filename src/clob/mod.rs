@@ -154,6 +154,7 @@
 
 pub mod client;
 pub mod metadata;
+pub mod metadata_view;
 pub mod order_builder;
 pub mod types;
 pub mod utilities;
