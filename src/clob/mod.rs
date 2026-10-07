@@ -153,6 +153,7 @@
 //! The default API endpoint is `https://clob-v2.polymarket.com`.
 
 pub mod client;
+pub mod metadata;
 pub mod order_builder;
 pub mod types;
 pub mod utilities;

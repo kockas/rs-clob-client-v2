@@ -28,6 +28,7 @@ use {tokio::sync::oneshot::Receiver, tokio::time, tokio_util::sync::Cancellation
 
 use crate::auth::state::{Authenticated, State, Unauthenticated};
 use crate::auth::{Credentials, Kind, Normal};
+use crate::clob::metadata::{MetadataError, MetadataRevision, MetadataState};
 use crate::clob::order_builder::{Limit, Market, OrderBuilder, generate_seed};
 use crate::clob::types::request::{
     BalanceAllowanceRequest, CancelMarketOrderRequest, DeleteNotificationsRequest,
@@ -267,6 +268,7 @@ impl<S: Signer, K: Kind> AuthenticationBuilder<'_, S, K> {
                 host: inner.host,
                 geoblock_host: inner.geoblock_host,
                 client: inner.client,
+                metadata_state: inner.metadata_state,
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
@@ -453,6 +455,8 @@ struct ClientInner<S: State> {
     geoblock_host: Url,
     /// The inner [`ReqwestClient`] used to make requests to `host`.
     client: ReqwestClient,
+    /// Short cache transaction fence. Never held during network/signing awaits.
+    metadata_state: MetadataState,
     /// Local cache of [`TickSize`] per token ID
     tick_sizes: DashMap<U256, TickSize>,
     /// Local cache representing whether this token is part of a `neg_risk` market
@@ -611,16 +615,38 @@ impl<S: State> Client<S> {
         &self.inner.host
     }
 
-    /// Invalidates all internal caches (tick sizes, neg risk flags, and fee rates).
+    /// Invalidates token/condition and builder metadata (including V2 fees).
+    /// The already cached global protocol version is deliberately retained.
+    /// Pending metadata responses cannot repopulate this new revision.
     ///
     /// This method clears the cached market configuration data, forcing subsequent
     /// requests to fetch fresh data from the API. Use this when you suspect
     /// cached data may be stale.
     pub fn invalidate_internal_caches(&self) {
+        let Ok(mut revision) = self.inner.metadata_state.lock() else {
+            return;
+        };
+        *revision = MetadataRevision::default();
         self.inner.tick_sizes.clear();
         self.inner.fee_rate_bps.clear();
         self.inner.neg_risk.clear();
+        self.inner.fee_infos.clear();
+        self.inner.token_condition_map.clear();
         self.inner.builder_fee_rates.clear();
+    }
+
+    /// Capture the revision before building/signing an order. Check it again
+    /// immediately before submitting an unsent request. This does not lock out
+    /// subsequent venue changes or classify requests already sent.
+    pub fn metadata_revision(&self) -> Result<MetadataRevision> {
+        Ok(self.inner.metadata_state.lock()?.clone())
+    }
+
+    /// Whether the revision belongs to this client's current cache state.
+    /// Fails closed on poisoning. Initial single-field fills keep the revision;
+    /// setters, invalidation, bulk refresh and forced version refresh change it.
+    pub fn metadata_is_current(&self, revision: &MetadataRevision) -> bool {
+        self.inner.metadata_state.check(revision).is_ok()
     }
 
     /// Pre-populates the tick size cache for a token, avoiding the HTTP call.
@@ -641,6 +667,10 @@ impl<S: State> Client<S> {
     /// # }
     /// ```
     pub fn set_tick_size(&self, token_id: U256, tick_size: TickSize) {
+        let Ok(mut revision) = self.inner.metadata_state.lock() else {
+            return;
+        };
+        *revision = MetadataRevision::default();
         self.inner.tick_sizes.insert(token_id, tick_size);
     }
 
@@ -662,6 +692,10 @@ impl<S: State> Client<S> {
     /// # }
     /// ```
     pub fn set_neg_risk(&self, token_id: U256, neg_risk: bool) {
+        let Ok(mut revision) = self.inner.metadata_state.lock() else {
+            return;
+        };
+        *revision = MetadataRevision::default();
         self.inner.neg_risk.insert(token_id, neg_risk);
     }
 
@@ -684,7 +718,7 @@ impl<S: State> Client<S> {
     /// # }
     /// ```
     pub fn set_fee_rate_bps(&self, token_id: U256, fee_rate_bps: u32) {
-        self.inner.fee_rate_bps.insert(
+        self.set_fee_rate(
             token_id,
             FeeRateResponse {
                 base_fee: fee_rate_bps,
@@ -694,6 +728,10 @@ impl<S: State> Client<S> {
 
     /// Pre-populates the fee rate cache for a token.
     pub fn set_fee_rate(&self, token_id: U256, fee_rate: FeeRateResponse) {
+        let Ok(mut revision) = self.inner.metadata_state.lock() else {
+            return;
+        };
+        *revision = MetadataRevision::default();
         self.inner.fee_rate_bps.insert(token_id, fee_rate);
     }
 
@@ -740,18 +778,29 @@ impl<S: State> Client<S> {
             version: u32,
         }
 
-        if !force {
+        let revision = {
+            let mut revision = self.inner.metadata_state.lock()?;
+            if force {
+                *revision = MetadataRevision::default();
+                self.inner.cached_version.store(0, Ordering::Relaxed);
+            }
             let cached = self.inner.cached_version.load(Ordering::Relaxed);
             if cached != 0 {
                 return Ok(cached);
             }
-        }
+            revision.clone()
+        };
 
         let request = self
             .client()
             .request(Method::GET, format!("{}version", self.host()))
             .build()?;
         let body: VersionBody = crate::request(&self.inner.client, request, None).await?;
+        let _guard = self.inner.metadata_state.check(&revision)?;
+        let cached = self.inner.cached_version.load(Ordering::Relaxed);
+        if cached != 0 {
+            return Ok(cached);
+        }
         self.inner
             .cached_version
             .store(body.version, Ordering::Relaxed);
@@ -899,13 +948,17 @@ impl<S: State> Client<S> {
     ///
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn tick_size(&self, token_id: U256) -> Result<TickSizeResponse> {
-        if let Some(tick_size) = self.inner.tick_sizes.get(&token_id) {
-            #[cfg(feature = "tracing")]
-            tracing::trace!(token_id = %token_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
-            return Ok(TickSizeResponse {
-                minimum_tick_size: *tick_size,
-            });
-        }
+        let revision = {
+            let revision = self.inner.metadata_state.lock()?;
+            if let Some(tick_size) = self.inner.tick_sizes.get(&token_id) {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(token_id = %token_id, tick_size = ?tick_size.value(), "cache hit: tick_size");
+                return Ok(TickSizeResponse {
+                    minimum_tick_size: *tick_size,
+                });
+            }
+            revision.clone()
+        };
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cache miss: tick_size");
@@ -918,7 +971,12 @@ impl<S: State> Client<S> {
 
         let response =
             crate::request::<TickSizeResponse>(&self.inner.client, request, None).await?;
-
+        let _guard = self.inner.metadata_state.check(&revision)?;
+        if let Some(cached) = self.inner.tick_sizes.get(&token_id) {
+            return Ok(TickSizeResponse {
+                minimum_tick_size: *cached,
+            });
+        }
         self.inner
             .tick_sizes
             .insert(token_id, response.minimum_tick_size);
@@ -939,13 +997,17 @@ impl<S: State> Client<S> {
     ///
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn neg_risk(&self, token_id: U256) -> Result<NegRiskResponse> {
-        if let Some(neg_risk) = self.inner.neg_risk.get(&token_id) {
-            #[cfg(feature = "tracing")]
-            tracing::trace!(token_id = %token_id, neg_risk = *neg_risk, "cache hit: neg_risk");
-            return Ok(NegRiskResponse {
-                neg_risk: *neg_risk,
-            });
-        }
+        let revision = {
+            let revision = self.inner.metadata_state.lock()?;
+            if let Some(neg_risk) = self.inner.neg_risk.get(&token_id) {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(token_id = %token_id, neg_risk = *neg_risk, "cache hit: neg_risk");
+                return Ok(NegRiskResponse {
+                    neg_risk: *neg_risk,
+                });
+            }
+            revision.clone()
+        };
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cache miss: neg_risk");
@@ -957,7 +1019,10 @@ impl<S: State> Client<S> {
             .build()?;
 
         let response = crate::request::<NegRiskResponse>(&self.inner.client, request, None).await?;
-
+        let _guard = self.inner.metadata_state.check(&revision)?;
+        if let Some(cached) = self.inner.neg_risk.get(&token_id) {
+            return Ok(NegRiskResponse { neg_risk: *cached });
+        }
         self.inner.neg_risk.insert(token_id, response.neg_risk);
 
         #[cfg(feature = "tracing")]
@@ -975,11 +1040,15 @@ impl<S: State> Client<S> {
     ///
     /// Returns an error if the request fails or the token ID is invalid.
     pub async fn fee_rate_bps(&self, token_id: U256) -> Result<FeeRateResponse> {
-        if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
-            #[cfg(feature = "tracing")]
-            tracing::trace!(token_id = %token_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
-            return Ok(cached.clone());
-        }
+        let revision = {
+            let revision = self.inner.metadata_state.lock()?;
+            if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
+                #[cfg(feature = "tracing")]
+                tracing::trace!(token_id = %token_id, base_fee = cached.base_fee, "cache hit: fee_rate_bps");
+                return Ok(cached.clone());
+            }
+            revision.clone()
+        };
 
         #[cfg(feature = "tracing")]
         tracing::trace!(token_id = %token_id, "cache miss: fee_rate_bps");
@@ -991,7 +1060,10 @@ impl<S: State> Client<S> {
             .build()?;
 
         let response = crate::request::<FeeRateResponse>(&self.inner.client, request, None).await?;
-
+        let _guard = self.inner.metadata_state.check(&revision)?;
+        if let Some(cached) = self.inner.fee_rate_bps.get(&token_id) {
+            return Ok(cached.clone());
+        }
         self.inner.fee_rate_bps.insert(token_id, response.clone());
 
         #[cfg(feature = "tracing")]
@@ -1335,13 +1407,33 @@ impl<S: State> Client<S> {
 
     /// Returns combined CLOB market info for a condition ID.
     ///
-    /// Also populates the local caches for tick size, neg risk, and fee rate
-    /// for all tokens in the market.
+    /// Atomically refreshes tick size, neg risk, V2 fees and condition mappings
+    /// for all returned tokens. Unlike a single-field initial cache fill, this
+    /// is an explicit revision-changing refresh, including its first call.
+    /// Responses superseded by another metadata transaction are rejected.
     ///
     /// # Errors
     ///
     /// Returns an error if the request fails or the condition ID is invalid.
     pub async fn clob_market_info(&self, condition_id: &str) -> Result<ClobMarketInfoResponse> {
+        let revision = self.metadata_revision()?;
+        self.clob_market_info_at_revision(condition_id, None, &revision)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    async fn clob_market_info_at_revision(
+        &self,
+        condition_id: &str,
+        required_token: Option<U256>,
+        revision: &MetadataRevision,
+    ) -> Result<(ClobMarketInfoResponse, MetadataRevision)> {
+        let required_condition: B256 = condition_id
+            .parse()
+            .map_err(|_| Error::validation("invalid metadata condition identity"))?;
+        // A dependent token-to-condition lookup must not silently adopt a new
+        // revision between awaits. No guard survives request construction/HTTP.
+        drop(self.inner.metadata_state.check(revision)?);
         let request = self
             .client()
             .request(
@@ -1353,6 +1445,13 @@ impl<S: State> Client<S> {
         let response: ClobMarketInfoResponse =
             crate::request(&self.inner.client, request, None).await?;
 
+        if response.condition_id != required_condition
+            || required_token
+                .is_some_and(|id| !response.tokens.iter().flatten().any(|t| t.token_id == id))
+        {
+            return Err(MetadataError::Unavailable.into());
+        }
+
         // Do NOT populate `fee_rate_bps` here — that cache belongs to the V1 `/fee-rate`
         // endpoint, which uses different units.
         let fee_info = response
@@ -1362,6 +1461,8 @@ impl<S: State> Client<S> {
                 rate: fd.rate,
                 exponent: fd.exponent,
             });
+        let mut guard = self.inner.metadata_state.check(revision)?;
+        *guard = MetadataRevision::default();
         for token in response.tokens.iter().flatten() {
             self.inner
                 .tick_sizes
@@ -1375,7 +1476,7 @@ impl<S: State> Client<S> {
                 .insert(token.token_id, response.condition_id);
         }
 
-        Ok(response)
+        Ok((response, guard.clone()))
     }
 
     /// Primes the tick-size, neg-risk, and fee caches for `token_id` from
@@ -1384,21 +1485,41 @@ impl<S: State> Client<S> {
     /// # Errors
     ///
     /// Returns an error if the market lookup or the clob-market-info fetch fails.
-    pub(crate) async fn ensure_market_info_cached(&self, token_id: U256) -> Result<()> {
-        if self.inner.fee_infos.contains_key(&token_id) {
-            return Ok(());
-        }
-        let condition_id = if let Some(cid) = self.inner.token_condition_map.get(&token_id) {
-            *cid
+    pub(crate) async fn ensure_market_info_cached(
+        &self,
+        token_id: U256,
+    ) -> Result<MetadataRevision> {
+        let (revision, cached_condition) = {
+            let revision = self.inner.metadata_state.lock()?;
+            if self.inner.fee_infos.contains_key(&token_id) {
+                return Ok(revision.clone());
+            }
+            (
+                revision.clone(),
+                self.inner.token_condition_map.get(&token_id).map(|v| *v),
+            )
+        };
+        let condition_id = if let Some(cid) = cached_condition {
+            cid
         } else {
             let market = self.market_by_token(token_id).await?;
-            self.inner
+            if market.primary_token_id != token_id && market.secondary_token_id != token_id {
+                return Err(MetadataError::Unavailable.into());
+            }
+            let _guard = self.inner.metadata_state.check(&revision)?;
+            // As with other single-field misses, preserve the first current
+            // completion; do not overwrite a concurrent canonical mapping.
+            let cid = *self
+                .inner
                 .token_condition_map
-                .insert(token_id, market.condition_id);
-            market.condition_id
+                .entry(token_id)
+                .or_insert(market.condition_id);
+            cid
         };
-        self.clob_market_info(&condition_id.to_string()).await?;
-        Ok(())
+        let (_, committed) = self
+            .clob_market_info_at_revision(&condition_id.to_string(), Some(token_id), &revision)
+            .await?;
+        Ok(committed)
     }
 
     /// Returns V2 fee parameters for `token_id`, priming the cache as needed.
@@ -1407,13 +1528,13 @@ impl<S: State> Client<S> {
     ///
     /// Returns an error if market metadata cannot be resolved.
     pub(crate) async fn fee_info(&self, token_id: U256) -> Result<FeeInfo> {
-        self.ensure_market_info_cached(token_id).await?;
-        Ok(self
-            .inner
+        let revision = self.ensure_market_info_cached(token_id).await?;
+        let _guard = self.inner.metadata_state.check(&revision)?;
+        self.inner
             .fee_infos
             .get(&token_id)
             .map(|e| *e)
-            .unwrap_or_default())
+            .ok_or_else(|| MetadataError::Unavailable.into())
     }
 
     /// Looks up a market by token ID.
@@ -1531,6 +1652,7 @@ impl Client<Unauthenticated> {
                 host: Url::parse(host)?,
                 geoblock_host,
                 client,
+                metadata_state: MetadataState::default(),
                 tick_sizes: DashMap::new(),
                 neg_risk: DashMap::new(),
                 fee_rate_bps: DashMap::new(),
@@ -1647,6 +1769,7 @@ impl<K: Kind> Client<Authenticated<K>> {
                 geoblock_host: inner.geoblock_host,
                 config: inner.config,
                 client: inner.client,
+                metadata_state: inner.metadata_state,
                 tick_sizes: inner.tick_sizes,
                 neg_risk: inner.neg_risk,
                 fee_rate_bps: inner.fee_rate_bps,
@@ -2544,9 +2667,13 @@ impl<K: Kind> Client<Authenticated<K>> {
     ///
     /// Returns an error if the request fails.
     pub async fn builder_fee_rate(&self, builder_code: B256) -> Result<BuilderFeeRateResponse> {
-        if let Some(cached) = self.inner.builder_fee_rates.get(&builder_code) {
-            return Ok(cached.clone());
-        }
+        let revision = {
+            let revision = self.inner.metadata_state.lock()?;
+            if let Some(cached) = self.inner.builder_fee_rates.get(&builder_code) {
+                return Ok(cached.clone());
+            }
+            revision.clone()
+        };
 
         let request = self
             .client()
@@ -2559,7 +2686,10 @@ impl<K: Kind> Client<Authenticated<K>> {
 
         let response: BuilderFeeRateResponse =
             crate::request(&self.inner.client, request, Some(headers)).await?;
-
+        let _guard = self.inner.metadata_state.check(&revision)?;
+        if let Some(cached) = self.inner.builder_fee_rates.get(&builder_code) {
+            return Ok(cached.clone());
+        }
         self.inner
             .builder_fee_rates
             .insert(builder_code, response.clone());

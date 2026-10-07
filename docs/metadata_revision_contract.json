@@ -1,0 +1,38 @@
+{
+  "schema": "clob_metadata_revision_contract_v1",
+  "date": "2026-10-07",
+  "baseline": "02980ee367643a9793bb5602232d2f82ac92a5c0",
+  "scope": "SDK cache consistency foundation for safe metadata prewarming. No application dependency update, prewarm scheduler, order retry policy or live deployment is included.",
+  "public_api": {
+    "metadata_revision": "Returns a Result containing an opaque cloneable revision. Capture before a multi-step build/sign/hash operation.",
+    "metadata_is_current": "Checks client identity and current revision. Check before admitting an unsent POST. This is not a lock over the network request, not proof of exchange acceptance and not evidence that an already sent request is unfilled.",
+    "MetadataError": "Changed, Unavailable or Poisoned; available through the existing typed Error source/downcast interface under Synchronization kind. No automatic retry or invented fallback value."
+  },
+  "revision": {
+    "mechanism": "One ClientInner-owned short mutex guards an Arc-identity revision and metadata cache access. Held revisions cannot alias later allocations; no counter overflow or growing generation tombstones.",
+    "scope": "Global per shared SDK client, deliberately conservative across tokens. SDK clones share caches and revision. Authentication-state changes move the revision with the caches and existing HTTP client.",
+    "lock_order": "Metadata mutex before metadata DashMap guard. No guard across an HTTP, header-creation, signing or callback await.",
+    "poisoning": "Read operations return typed Poisoned and current-check returns false. Legacy void setters/invalidation cannot restore a poisoned state. Normal production APIs expose no poisoning callback."
+  },
+  "operations": {
+    "single_field_getters": "tick_size, neg_risk, V1 fee_rate_bps, version and builder_fee_rate capture the revision at a cache miss and perform I/O outside the lock. Commit only in that same revision. Same-revision duplicate requests return the first committed canonical value. No singleflight or request coalescing is claimed.",
+    "setters": "set_tick_size, set_neg_risk, set_fee_rate_bps and set_fee_rate replace the revision atomically with their cache update, even if the value compares equal.",
+    "invalidation": "Atomically changes revision and clears tick, negative-risk, V1 fees, V2 fees, token-condition mappings and builder-fee caches. The global protocol version remains cached, preserving its explicit legacy behavior.",
+    "forced_version_refresh": "Existing version-mismatch handling advances the revision and clears the cached version before its HTTP refresh. Failed refresh cannot expose the old cached version. Obsolete replies cannot restore it. Existing convenience auto-retry code is unchanged; this patch adds no order retry.",
+    "bulk_market_info": "An explicit refresh transaction, including its first call. Bind response to requested condition, validate a required token for the internal market-order lookup, and reject obsolete responses before atomic cache mutation. An accepted commit advances the revision and updates all returned token fields together. A second bulk request captured in the previous revision cannot overwrite it.",
+    "dependent_v2_fee_lookup": "Validate requested token against markets-by-token, fence the mapping insertion and carry the original revision into bulk fetch. Read the final fee cache under the bulk commit revision. Invalidation or an omitted requested token returns typed changed/unavailable, not a manufactured zero fee. The existing absent-wire-fd default is retained separately."
+  },
+  "caller_requirements": [
+    "SDK revision checks do not make a complete build-sign-hash-POST operation atomic. A caller must fence every unsent request or chunk and preserve previously sent/ambiguous reservations.",
+    "Single-field initialization does not invalidate its own invocation. Bulk refresh does: a future adapter fence can conservatively reject a cold market-order build crossing its own first V2 fee refresh. Do not automatically resend such an order. Prewarm or explicitly design the next invocation.",
+    "A failed optional refresh leaves previously valid cache state unless the caller first declared it invalid. Known stale metadata requires explicit invalidation; this patch does not subscribe to market tick updates or establish a TTL.",
+    "A metadata change after pre-POST admission is an ordinary concurrent venue update, not proof the order was never sent.",
+    "Existing cache storage lifetime is unchanged. This patch does not add unbounded revision histories; application scope retirement and bounded prewarm scheduling remain separate work."
+  ],
+  "unchanged": ["order builder formulas", "EIP712 domains", "signing", "hash identity", "nonce", "credential derivation", "HTTP connection pool", "WebSocket protocols"],
+  "tests": {
+    "new": "tests/metadata_cache.rs and tests/metadata_epoch.rs: deterministic held HTTP replies, canonical response order, setters/invalidation/refresh, identity binding, V2 fee lookup and absent-wire default, forced-version races/failure, auth transitions, exact signing/hash equality, compile-time Send checks, poison/Arc identity primitives.",
+    "regression": "cargo test --features clob,ws,tracing --lib --test metadata_cache --test metadata_epoch --test auth --test clob --test order --test post_response_trade_ids --test websocket --test ws_evidence_health -- --test-threads=1",
+    "completed": "396 passed, zero failed/ignored, across library and eight integration targets; literal loopback synthetic credentials for new HTTP cases. Request counts and values, not elapsed speed, are acceptance."
+  }
+}
