@@ -711,6 +711,23 @@ impl<S: State> Client<S> {
         self.inner.tick_sizes.insert(token_id, tick_size);
     }
 
+    /// Apply an authoritative receipt only if its preparation revision still
+    /// holds. The comparison, mutation and returned new revision are one cache
+    /// transaction. An obsolete receipt does not change any cached field.
+    /// This mutator is unavailable on immutable preparation views.
+    pub fn set_tick_size_if_current(
+        &self,
+        token_id: U256,
+        tick_size: TickSize,
+        expected: &MetadataRevision,
+    ) -> Result<MetadataRevision> {
+        self.require_submission_client()?;
+        let mut revision = self.inner.metadata_state.check(expected)?;
+        *revision = MetadataRevision::default();
+        self.inner.tick_sizes.insert(token_id, tick_size);
+        Ok(revision.clone())
+    }
+
     /// Pre-populates the neg risk cache for a token, avoiding the HTTP call.
     ///
     /// Use this when you already have the neg risk data from another source
@@ -837,6 +854,9 @@ impl<S: State> Client<S> {
             .build()?;
         let body: VersionBody = crate::request(&self.inner.client, request, None).await?;
         let _guard = self.inner.metadata_state.check(&revision)?;
+        if !matches!(body.version, 1 | 2) {
+            return Err(MetadataError::Unavailable.into());
+        }
         let cached = self.inner.cached_version.load(Ordering::Relaxed);
         if cached != 0 {
             return Ok(cached);

@@ -30,6 +30,54 @@ type Sdk = Client<Authenticated<Normal>>;
 const TOKEN: u64 = 123;
 const OTHER: u64 = 456;
 const CONDITION: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
+
+#[tokio::test]
+async fn unsupported_version_is_not_cached_and_fresh_invocation_recovers() {
+    for unsupported in [0,3,u32::MAX] {
+        let server=Server::new(2,false).await;
+        let sdk=client(&server).await;
+        server.plan("/version",Reply::ok(json!({"version":unsupported})));
+        let rev=sdk.metadata_revision().unwrap();
+        assert_eq!(sdk.version().await.unwrap_err().downcast_ref::<MetadataError>(),Some(&MetadataError::Unavailable));
+        assert!(sdk.metadata_is_current(&rev));
+        assert_eq!(sdk.version().await.unwrap(),2);
+        assert_eq!(sdk.version().await.unwrap(),2);
+        assert_eq!(server.seen(),["GET /version","GET /version"]);
+    }
+    let server=Server::new(2,false).await;let sdk=client(&server).await;
+    let gate=Gate::new();server.plan("/version",Reply::held(json!({"version":3}),gate.clone()));
+    let clone=sdk.clone();let pending=tokio::spawn(async move {clone.version().await});
+    gate.entered().await;sdk.invalidate_internal_caches();
+    assert_eq!(sdk.version().await.unwrap(),2);
+    gate.release();
+    assert_eq!(pending.await.unwrap().unwrap_err().downcast_ref::<MetadataError>(),Some(&MetadataError::Changed));
+    assert_eq!(sdk.version().await.unwrap(),2);
+}
+
+#[tokio::test]
+async fn conditional_tick_setter_is_atomic_and_does_not_adopt_intervening_revision() {
+    let server = Server::new(2, false).await;
+    let sdk = client(&server).await;
+    let token = U256::from(TOKEN);
+    let admitted = sdk.metadata_revision().unwrap();
+    let view = sdk.metadata_view(&admitted).unwrap();
+    let committed = sdk.set_tick_size_if_current(token, TickSize::Thousandth, &admitted).unwrap();
+    assert!(sdk.metadata_is_current(&committed));
+    assert_ne!(admitted, committed);
+    assert!(view.tick_size(token).await.is_err());
+    assert_eq!(sdk.tick_size(token).await.unwrap().minimum_tick_size, TickSize::Thousandth);
+    // Deterministically interpose an unrelated root writer between receipt
+    // admission and conditional mutation. Failure must neither mutate nor
+    // return the newer writer's revision as if we owned that transaction.
+    sdk.invalidate_internal_caches();
+    sdk.set_tick_size(token, TickSize::Hundredth);
+    let newer = sdk.metadata_revision().unwrap();
+    let error = sdk.set_tick_size_if_current(token, TickSize::Thousandth, &committed).unwrap_err();
+    assert_eq!(error.downcast_ref::<MetadataError>(), Some(&MetadataError::Changed));
+    assert!(sdk.metadata_is_current(&newer));
+    assert_eq!(sdk.tick_size(token).await.unwrap().minimum_tick_size, TickSize::Hundredth);
+    assert!(server.seen().is_empty());
+}
 fn bulk(tick: &str, neg: bool, tokens: &[u64], fee: Option<&str>) -> Value {
     let mut body = json!({"c":CONDITION,"mts":tick,"nr":neg,"mos":"5",
         "t":tokens.iter().map(|id|json!({"t":id.to_string(),"o":"test"})).collect::<Vec<_>>()});
