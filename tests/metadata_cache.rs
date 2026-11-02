@@ -1290,3 +1290,182 @@ async fn dropping_bound_views_and_builders_does_not_cancel_root_heartbeats() {
     assert!(sdk.heartbeats_active());
     sdk.stop_heartbeats().await.unwrap();
 }
+
+// Behavioral RED compatibility: the old SDK can only invalidate ALL caches.
+// Keep these call sites unchanged when the additive inherent method lands:
+// Rust resolves the inherent method before this test-local legacy fallback.
+// This deliberately does not emulate selective eviction or atomic production
+// synchronization. The expected-revision check exercises the old public API.
+static LEGACY_SCOPED_INVALIDATION_CALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[allow(dead_code)]
+trait LegacyScopedInvalidation {
+    fn invalidate_tokens_if_current(
+        &self,
+        tokens: &[U256],
+        expected: &polymarket_client_sdk_v2::clob::metadata::MetadataRevision,
+    ) -> polymarket_client_sdk_v2::Result<polymarket_client_sdk_v2::clob::metadata::MetadataRevision>;
+}
+impl LegacyScopedInvalidation for Sdk {
+    fn invalidate_tokens_if_current(
+        &self,
+        tokens: &[U256],
+        expected: &polymarket_client_sdk_v2::clob::metadata::MetadataRevision,
+    ) -> polymarket_client_sdk_v2::Result<polymarket_client_sdk_v2::clob::metadata::MetadataRevision> {
+        LEGACY_SCOPED_INVALIDATION_CALLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !self.metadata_is_current(expected) {
+            return Err(MetadataError::Changed.into());
+        }
+        if !tokens.is_empty() {
+            self.invalidate_internal_caches();
+        }
+        self.metadata_revision()
+    }
+}
+
+#[tokio::test]
+async fn scoped_invalidation_retains_unaffected_caches_and_refetches_retired_token() {
+    let server = Server::new(1, false).await;
+    let sdk = client(&server).await;
+    warm(&sdk, TOKEN).await;
+    server.plan("/tick-size?token_id=456", Reply::ok(json!({"minimum_tick_size":"0.001"})));
+    server.plan("/neg-risk?token_id=456", Reply::ok(json!({"neg_risk":true})));
+    server.plan("/fee-rate?token_id=456", Reply::ok(json!({"base_fee":10})));
+    warm(&sdk, OTHER).await;
+    let builder = alloy::primitives::B256::ZERO;
+    sdk.builder_fee_rate(builder).await.unwrap();
+    let revision = sdk.metadata_revision().unwrap();
+    let old_view = sdk.metadata_view(&revision).unwrap();
+    let before = server.seen();
+    let current = sdk.invalidate_tokens_if_current(
+        &[U256::from(TOKEN), U256::from(TOKEN)], &revision,
+    ).unwrap();
+    assert_ne!(current, revision);
+    assert!(sdk.metadata_is_current(&current));
+    // The existing GLOBAL revision conservatively rejects old preparation,
+    // including an unrelated token. It must never be silently rebound.
+    changed(old_view.tick_size(U256::from(OTHER)).await);
+    changed(old_view.metadata_revision());
+    assert_eq!(server.seen(), before, "invalidation/old-view rejection performs no HTTP");
+
+    let tick = sdk.tick_size(U256::from(OTHER)).await.unwrap().minimum_tick_size;
+    let neg = sdk.neg_risk(U256::from(OTHER)).await.unwrap().neg_risk;
+    let fee = sdk.fee_rate_bps(U256::from(OTHER)).await.unwrap().base_fee;
+    assert_eq!(sdk.version().await.unwrap(), 1);
+    assert_eq!(sdk.builder_fee_rate(builder).await.unwrap().builder_taker_fee_rate_bps, 10);
+    assert_eq!(server.seen(), before,
+        "scoped retirement must retain unrelated token, version and builder cache hits");
+    assert_eq!((tick, neg, fee), (TickSize::Thousandth, true, 10));
+
+    for field in [Field::Tick, Field::Neg, Field::Fee] {
+        server.plan(&field.path(), Reply::ok(field.reply(true)));
+        let count = server.seen().len();
+        let fresh = field.read(&sdk).await.unwrap();
+        assert_eq!(server.seen().len(), count + 1, "retired {field:?} needs a fresh GET");
+        assert_eq!(field.read(&sdk).await.unwrap(), fresh);
+        assert_eq!(server.seen().len(), count + 1);
+    }
+    assert!(sdk.metadata_is_current(&current), "initial field fills retain the new revision");
+    assert!(!LEGACY_SCOPED_INVALIDATION_CALLED.load(std::sync::atomic::Ordering::Relaxed),
+        "GREEN must dispatch the SDK inherent method, never the legacy fallback");
+}
+
+#[tokio::test]
+async fn scoped_invalidation_fences_held_old_http_without_losing_other_token() {
+    let mut retained_request_counts = Vec::new();
+    for field in [Field::Tick, Field::Neg, Field::Fee] {
+        let server = Server::new(1, false).await;
+        let sdk = client(&server).await;
+        warm(&sdk, OTHER).await;
+        let revision = sdk.metadata_revision().unwrap();
+        let old_view = sdk.metadata_view(&revision).unwrap();
+        let gate = Gate::new();
+        server.plan(&field.path(), Reply::held(field.reply(false), gate.clone()));
+        let mut old = Box::pin(field.read(&sdk));
+        enter!(old, gate); // Positive witness: the old HTTP request reached the server.
+        let current = sdk.invalidate_tokens_if_current(&[U256::from(TOKEN)], &revision).unwrap();
+        gate.release();
+        changed(bounded(old).await);
+        changed(field.read_view(&old_view).await);
+        // Release old HTTP BEFORE the new request: a stale insertion would
+        // incorrectly turn this mandatory fresh request into a cache hit.
+        server.plan(&field.path(), Reply::ok(field.reply(true)));
+        let count = server.seen().len();
+        let canonical = field.read(&sdk).await.unwrap();
+        assert_eq!(server.seen().len(), count + 1, "old {field:?} response repopulated retired cache");
+        assert_eq!(field.read(&sdk).await.unwrap(), canonical);
+        assert!(sdk.metadata_is_current(&current));
+        let before = server.seen().len();
+        warm(&sdk, OTHER).await;
+        retained_request_counts.push(server.seen().len() - before);
+    }
+    assert_eq!(retained_request_counts, [0, 0, 0],
+        "fencing held HTTP must preserve unrelated admission cache values");
+}
+
+#[tokio::test]
+async fn scoped_invalidation_stale_expected_and_empty_selection_are_noops() {
+    let server = Server::new(1, false).await;
+    let sdk = client(&server).await;
+    warm(&sdk, TOKEN).await;
+    warm(&sdk, OTHER).await;
+    let stale = sdk.metadata_revision().unwrap();
+    sdk.set_tick_size(U256::from(OTHER), TickSize::Thousandth);
+    let current = sdk.metadata_revision().unwrap();
+    let before = server.seen();
+    changed(sdk.invalidate_tokens_if_current(&[U256::from(TOKEN)], &stale));
+    changed(sdk.invalidate_tokens_if_current(&[], &stale));
+    assert_eq!(sdk.invalidate_tokens_if_current(&[], &current).unwrap(), current);
+    assert!(sdk.metadata_is_current(&current));
+    warm(&sdk, TOKEN).await;
+    warm(&sdk, OTHER).await;
+    assert_eq!(sdk.tick_size(U256::from(OTHER)).await.unwrap().minimum_tick_size, TickSize::Thousandth);
+    assert_eq!(server.seen(), before, "rejected/empty mutations preserve both cache and revision");
+}
+
+#[tokio::test]
+async fn scoped_invalidation_evicts_v2_fee_and_condition_mapping_only_for_selected_token() {
+    let server = Server::new(2, false).await;
+    let sdk = client(&server).await;
+    let sibling = 124;
+    let other_condition = format!("0x{:064x}", 2);
+    let fresh_condition = format!("0x{:064x}", 3);
+    server.plan(&format!("/clob-markets/{CONDITION}"),
+        Reply::ok(bulk("0.01", false, &[TOKEN, sibling], Some("0.07"))));
+    sdk.clob_market_info(CONDITION).await.unwrap();
+    let mut other = bulk("0.001", true, &[OTHER], Some("0.05"));
+    other["c"] = json!(other_condition);
+    other["fd"]["e"] = json!(2);
+    server.plan(&format!("/clob-markets/{other_condition}"), Reply::ok(other));
+    sdk.clob_market_info(&other_condition).await.unwrap();
+    let revision = sdk.metadata_revision().unwrap();
+    let before = server.seen();
+    let current = sdk.invalidate_tokens_if_current(&[U256::from(TOKEN)], &revision).unwrap();
+    let view = sdk.metadata_view(&current).unwrap();
+    assert_eq!(view.fee_exponent(U256::from(TOKEN)).await.unwrap_err().downcast_ref::<MetadataError>(),
+        Some(&MetadataError::RefreshRequired), "retired V2 fee must not be a cache hit");
+    // Both a same-condition sibling and a different condition retain authority.
+    let sibling_fee = view.fee_exponent(U256::from(sibling)).await;
+    let other_fee = view.fee_exponent(U256::from(OTHER)).await;
+    assert_eq!(sibling_fee.unwrap(), 1, "same-condition sibling cache was evicted");
+    assert_eq!(other_fee.unwrap(), 2, "unrelated condition cache was evicted");
+    assert_eq!(server.seen(), before, "bound views never refresh missing V2 metadata");
+
+    server.plan(&format!("/markets-by-token/{TOKEN}"), Reply::ok(json!({
+        "condition_id":fresh_condition,"primary_token_id":TOKEN.to_string(),
+        "secondary_token_id":sibling.to_string()
+    })));
+    let mut fresh = bulk("0.001", true, &[TOKEN], Some("0.03"));
+    fresh["c"] = json!(fresh_condition);
+    fresh["fd"]["e"] = json!(3);
+    server.plan(&format!("/clob-markets/{fresh_condition}"), Reply::ok(fresh));
+    assert_eq!(sdk.fee_exponent(U256::from(TOKEN)).await.unwrap(), 3);
+    assert_eq!(&server.seen()[before.len()..], &[
+        format!("GET /markets-by-token/{TOKEN}"),
+        format!("GET /clob-markets/{fresh_condition}"),
+    ], "retired token-condition mapping must be resolved again");
+    let after = server.seen();
+    assert_eq!(sdk.fee_exponent(U256::from(sibling)).await.unwrap(), 1);
+    assert_eq!(sdk.fee_exponent(U256::from(OTHER)).await.unwrap(), 2);
+    assert_eq!(server.seen(), after);
+}

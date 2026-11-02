@@ -639,6 +639,33 @@ impl<S: State> Client<S> {
         self.inner.builder_fee_rates.clear();
     }
 
+    /// Retire selected token metadata only if the caller's revision is current.
+    /// Comparison, eviction and the returned revision are one transaction.
+    /// Unrelated token caches, protocol version and builder fees are retained.
+    /// The existing global revision still fences ALL pending metadata writes
+    /// and preparation views; none may adopt the returned revision implicitly.
+    /// An empty selection validates the revision without changing it.
+    pub fn invalidate_tokens_if_current(
+        &self,
+        tokens: &[U256],
+        expected: &MetadataRevision,
+    ) -> Result<MetadataRevision> {
+        self.require_submission_client()?;
+        let tokens = tokens.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let mut revision = self.inner.metadata_state.check(expected)?;
+        if !tokens.is_empty() {
+            *revision = MetadataRevision::default();
+            for token in tokens {
+                self.inner.tick_sizes.remove(&token);
+                self.inner.neg_risk.remove(&token);
+                self.inner.fee_rate_bps.remove(&token);
+                self.inner.fee_infos.remove(&token);
+                self.inner.token_condition_map.remove(&token);
+            }
+        }
+        Ok(revision.clone())
+    }
+
     /// Capture the revision before building/signing an order. Check it again
     /// immediately before submitting an unsent request. This does not lock out
     /// subsequent venue changes or classify requests already sent.

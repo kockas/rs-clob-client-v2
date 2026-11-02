@@ -1,0 +1,21 @@
+{
+  "title": "Scoped SDK metadata eviction under existing global revision",
+  "parent_commit": "0b86465fb52c11ac5039fb7664ecfc6b41e42b91",
+  "architects": {
+    "Bernoulli": "Final actual-diff and RED/GREEN approval; no unresolved objections",
+    "Aristotle": "Final actual-diff and RED/GREEN approval; no unresolved objections",
+    "Cicero": "Final actual-diff and RED/GREEN approval; no unresolved objections"
+  },
+  "files": {
+    "src/clob/client.rs": "b11e509804a391b0299963cf135a7e33c7db01e6cc9cc993f0881a4b8d710dd5",
+    "tests/metadata_cache.rs": "0564b147e9ca5b85f7aebe8ec18a432d57866011e7198c9220c529a693c79b7f"
+  },
+  "evidence": {
+    "sdk-metadata-scope-red.log": "017d83248eb6d4d386b7835f782049be954de9dc504959df5e62b3ed23269534",
+    "sdk-metadata-scope-green.log": "71d1396ab2e282ebce4008c1f38977a621272f30422a60df3692db40e4def6c4"
+  },
+  "red": "3 intended cache-retention failures,1passingcontrol; real legacyglobal invalidator fallback; regression unchanged",
+  "green": "30 metadata_cache +2 metadata_epoch PASS; test asserts inherent dispatch, no fallback",
+  "contract": "Expected revision checked under existing metadata lock; nonempty selection changes global revision once and evicts selected tick, neg-risk, V1/V2 fees and token-condition only. Empty validates without mutation; root/preparation boundary retained. Old preparations and pending HTTP remain globally fenced. Unrelated/version/builder caches preserved. No per-token revision system.",
+  "scope": "Application integration and live activation not approved by this SDK review"
+}
