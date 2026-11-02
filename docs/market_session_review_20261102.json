@@ -1,0 +1,34 @@
+{
+  "title": "Persistent ordered market session SDK review",
+  "base": "4f80da7cf4c2459624de9a20bc1dd1ff9023f2d8",
+  "design_sha256": "0f64fc1f0652057376553cc4bb78e5b6aa4b6f9fc328d2888290d504fc7d15c7",
+  "source_sha256": {
+    "src/clob/ws/client.rs": "8f456b13d08be81f4c0f9052e36fd12e36a5fc8f9e4bf9504b6859e0efa5117e",
+    "src/clob/ws/mod.rs": "112c0a0b6190cf7eb6f3936bbbc8b41d02ea73496462f9a5415d01a6a6a04688",
+    "src/clob/ws/subscription.rs": "2a3d77a2eff05adfc8e55954fed58271673e82369e05cc52b6a40cdbd02b369d",
+    "src/clob/ws/market_session.rs": "a900c93a0740b15b9c99b3ddddfaf7e3d1b2e20429e53448ab242d951d4bcbef",
+    "src/ws/connection.rs": "6c987aa072332adb8b37e4c0f1c7d8ac269ff3c92c220f25230cbc7049eab491",
+    "tests/market_event_session.rs": "c438dcc55cd9eb09d553333aaaa33ca5fc082d3ca6975c6270e38c45943e4167",
+    "tests/market_session_transport.rs": "41da18fde32081b5a887b5060cc032121363f224ce78144a2d13f45a499d2f10",
+    "tests/market_session_lifecycle.rs": "693adca12f2ae15ce4a2f2fec2fef38f6803ae4cc165406049337499292a8c95"
+  },
+  "evidence": {
+    "old_api_feed_red": "pm-scope-red.log: replacement socket, lost unchanged pair readiness",
+    "lifetime_red": "sdk-lifecycle-red.log: fresh Ping gets Pong after owners dropped",
+    "green": "sdk-final-verification.log",
+    "green_sha256": "58aca9c1ad68158682dfe1737647c42e33b651e81374c4068ebef88aa339a26b",
+    "result": "60 PASS, five binaries, zero failed/ignored; 19 focused and41legacy"
+  },
+  "reviewers": {
+    "Bernoulli": "Final SDK scoped approval, no unresolved objections",
+    "Aristotle": "Final SDK scoped approval, no unresolved objections",
+    "Cicero": "Final original eight-file actual diff and60PASS approval; explicit direct message received"
+  },
+  "boundaries": [
+    "One ordered persistent socket/receiver; local enqueue cuts are not server ACK",
+    "Non-owning membership view; consumed snapshots establish application readiness",
+    "Real transport loss remains global; unchanged token incarnations stable",
+    "No application integration approval or live-start permission implied"
+  ],
+  "publication": "Reviewed exact SDK branch; worker dependency must pin immutable published revision"
+}

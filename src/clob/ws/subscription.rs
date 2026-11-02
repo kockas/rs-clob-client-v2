@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Instant;
 
 use async_stream::try_stream;
@@ -74,11 +74,13 @@ pub enum ChannelType {
 
 /// Manages active subscriptions and routes messages to subscribers.
 pub struct SubscriptionManager {
-    connection: ConnectionManager<WsMessage, Arc<InterestTracker>>,
-    active_subs: DashMap<String, SubscriptionInfo>,
-    interest: Arc<InterestTracker>,
+    pub(super) connection: ConnectionManager<WsMessage, Arc<InterestTracker>>,
+    pub(super) active_subs: DashMap<String, SubscriptionInfo>,
+    pub(super) interest: Arc<InterestTracker>,
     /// Subscribed assets with reference counts (for multiplexing)
-    subscribed_assets: DashMap<U256, usize>,
+    pub(super) subscribed_assets: DashMap<U256, usize>,
+    /// Serializes legacy and ordered-session ownership before publication.
+    pub(super) market_registry: Mutex<MarketRegistry>,
     /// Subscribed markets with reference counts (for multiplexing)
     subscribed_markets: DashMap<B256, usize>,
     last_auth: Arc<RwLock<Option<Credentials>>>,
@@ -94,6 +96,15 @@ pub struct SubscriptionManager {
     resub_handle: OnceLock<JoinHandle<()>>,
 }
 
+#[derive(Default)]
+pub(super) struct MarketRegistry {
+    // Legacy unsubscribe must never steal an ordered session's owned reference.
+    pub legacy: HashMap<U256, usize>,
+    pub sessions: HashSet<u64>,
+    pub next_session: u64,
+    pub next_incarnation: u64,
+}
+
 impl SubscriptionManager {
     /// Create a new subscription manager.
     #[must_use]
@@ -106,6 +117,7 @@ impl SubscriptionManager {
             active_subs: DashMap::new(),
             interest,
             subscribed_assets: DashMap::new(),
+            market_registry: Mutex::new(MarketRegistry::default()),
             subscribed_markets: DashMap::new(),
             last_auth: Arc::new(RwLock::new(None)),
             custom_features_enabled: AtomicBool::new(false),
@@ -177,6 +189,10 @@ impl SubscriptionManager {
 
     /// Re-send subscription requests for all tracked assets and markets.
     fn resubscribe_all(&self) {
+        let _registry = self
+            .market_registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // Collect all subscribed assets
         let assets: Vec<U256> = self.subscribed_assets.iter().map(|r| *r.key()).collect();
 
@@ -254,7 +270,15 @@ impl SubscriptionManager {
             .into());
         }
 
+        let mut registry = self
+            .market_registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         self.interest.add(MessageInterest::MARKET);
+        for token in &asset_ids {
+            *registry.legacy.entry(*token).or_default() += 1;
+        }
 
         // Track if custom features are enabled (for re-subscription on reconnect)
         if custom_features {
@@ -463,7 +487,13 @@ impl SubscriptionManager {
     #[must_use]
     pub fn has_subscriptions(&self, channel: ChannelType) -> bool {
         match channel {
-            ChannelType::Market => !self.subscribed_assets.is_empty(),
+            ChannelType::Market => {
+                let registry = self
+                    .market_registry
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                !self.subscribed_assets.is_empty() || !registry.sessions.is_empty()
+            }
             ChannelType::User => !self.subscribed_markets.is_empty(),
         }
     }
@@ -482,11 +512,23 @@ impl SubscriptionManager {
             .into());
         }
 
+        let mut registry = self
+            .market_registry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
         let mut to_unsubscribe = Vec::new();
 
         // Atomically decrement refcounts and remove assets that reach zero
         // Using Entry API to prevent TOCTOU race between decrement and removal
         for id in asset_ids {
+            let Some(count) = registry.legacy.get_mut(id) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                registry.legacy.remove(id);
+            }
             if let Entry::Occupied(mut entry) = self.subscribed_assets.entry(*id) {
                 let refcount = entry.get_mut();
                 *refcount = refcount.saturating_sub(1);
@@ -510,7 +552,10 @@ impl SubscriptionManager {
         }
 
         // Remove active_subs entries where all assets are now unsubscribed
-        self.active_subs.retain(|_, info| {
+        self.active_subs.retain(|key, info| {
+            if key.starts_with("market-session:") {
+                return true;
+            }
             if let SubscriptionTarget::Assets(assets) = &info.target {
                 // Keep entry only if at least one asset is still subscribed
                 assets

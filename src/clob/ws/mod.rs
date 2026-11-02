@@ -5,11 +5,16 @@
 
 pub mod client;
 pub mod interest;
+pub mod market_session;
 pub mod subscription;
 pub mod types;
 
 // Re-export commonly used types
 pub use client::Client;
+pub use market_session::{
+    MarketEventSession, MarketMembership, MarketSessionEvent, ScopeChange, ScopeSnapshot,
+    TokenBinding,
+};
 pub use subscription::{ChannelType, SubscriptionInfo, SubscriptionTarget};
 pub use types::request::SubscriptionRequest;
 pub use types::response::{

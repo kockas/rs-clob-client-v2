@@ -136,6 +136,20 @@ impl Client<Unauthenticated> {
 
 // Methods available in any state
 impl<S: State> Client<S> {
+    /// One persistent ordered market receiver with mutable asset membership.
+    /// Scope changes are local queued intent, not server acknowledgments.
+    /// New tokens still require matching full snapshots consumed by the caller.
+    pub fn market_event_session(
+        &self,
+        initial_assets: Vec<U256>,
+    ) -> Result<super::market_session::MarketEventSession> {
+        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
+        super::market_session::MarketEventSession::new(
+            Arc::clone(&resources.subscriptions),
+            initial_assets,
+        )
+    }
+
     /// Subscribes to real-time orderbook updates for specified market assets.
     ///
     /// Returns a stream of orderbook snapshots showing all bid and ask levels.

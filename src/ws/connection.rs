@@ -8,6 +8,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::time::Instant;
 
 use backoff::backoff::Backoff as _;
@@ -48,7 +49,93 @@ pub struct ConnectionHealth {
 struct Evidence {
     faults: u64,
     messages: u64,
+    transport_epoch: u64,
+    epoch_start_sequence: u64,
     receipts: VecDeque<Instant>,
+}
+
+/// Control metadata, read under the same lock as broadcast publication.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EvidenceStamp {
+    pub faults: u64,
+    pub messages: u64,
+    pub transport_epoch: u64,
+    pub epoch_start_sequence: u64,
+}
+
+enum Outgoing {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+/// The socket loop's actual batch writer. Stop at the first failed member;
+/// neither the tail nor an already-written prefix is retried on a new socket.
+pub(crate) async fn write_batch<S>(
+    sink: &mut S,
+    batch: Vec<String>,
+) -> std::result::Result<(), S::Error>
+where
+    S: futures::Sink<Message> + Unpin,
+{
+    for text in batch {
+        sink.send(Message::Text(text.into())).await?;
+    }
+    Ok(())
+}
+
+/// Registry owners acquire this AFTER their own mutation lock. No callback,
+/// serialization or await is permitted inside the publication transaction.
+pub(crate) struct Publication<'a, M> {
+    evidence: Option<MutexGuard<'a, Evidence>>,
+    before: (u64, u64),
+    changed: &'a watch::Sender<()>,
+    sender: &'a mpsc::UnboundedSender<Outgoing>,
+    broadcast: &'a broadcast::Sender<M>,
+}
+
+impl<M: Clone> Publication<'_, M> {
+    pub fn stamp(&self) -> EvidenceStamp {
+        let e = self.evidence.as_ref().unwrap();
+        EvidenceStamp {
+            faults: e.faults,
+            messages: e.messages,
+            transport_epoch: e.transport_epoch,
+            epoch_start_sequence: e.epoch_start_sequence,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<M> {
+        self.broadcast.subscribe()
+    }
+
+    pub fn enqueue_batch(&mut self, serialized: Vec<String>) -> Result<()> {
+        if self.sender.is_closed() {
+            self.fault();
+            return Err(WsError::ConnectionClosed.into());
+        }
+        if !serialized.is_empty() && self.sender.send(Outgoing::Batch(serialized)).is_err() {
+            self.fault();
+            return Err(WsError::ConnectionClosed.into());
+        }
+        Ok(())
+    }
+
+    pub fn fault(&mut self) {
+        let e = self.evidence.as_mut().unwrap();
+        e.faults = e.faults.saturating_add(1);
+    }
+}
+
+impl<M> Drop for Publication<'_, M> {
+    fn drop(&mut self) {
+        let e = self.evidence.take().unwrap();
+        let changed = self.before != (e.faults, e.transport_epoch);
+        drop(e);
+        // Wake only after unlock. This watch carries no ordering authority.
+        if changed {
+            self.changed.send_replace(());
+        }
+    }
 }
 
 /// Connection state tracking.
@@ -119,10 +206,11 @@ where
     /// Watch channel receiver for state changes (for use in checking the current state)
     state_rx: watch::Receiver<ConnectionState>,
     /// Sender channel for outgoing messages
-    sender_tx: mpsc::UnboundedSender<String>,
+    sender_tx: mpsc::UnboundedSender<Outgoing>,
     /// Broadcast sender for incoming messages
     broadcast_tx: broadcast::Sender<M>,
     evidence: Arc<Mutex<Evidence>>,
+    evidence_changed: watch::Sender<()>,
     /// Aborts the spawned connection-loop task when the last `ConnectionManager`
     /// clone is dropped. Without this, the task holds `state_tx` and
     /// `sender_tx` indefinitely and reconnects forever even after every
@@ -159,6 +247,8 @@ where
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
         let evidence = Arc::new(Mutex::new(Evidence::default()));
         let evidence_task = evidence.clone();
+        let (evidence_changed, _) = watch::channel(());
+        let evidence_changed_task = evidence_changed.clone();
 
         // Spawn connection task
         let connection_config = config;
@@ -175,6 +265,7 @@ where
                 parser,
                 state_tx_clone,
                 evidence_task,
+                evidence_changed_task,
             )
             .await;
         });
@@ -185,6 +276,7 @@ where
             sender_tx,
             broadcast_tx,
             evidence,
+            evidence_changed,
             _task_guard: Arc::new(AbortOnDropHandle(handle)),
             _phantom: PhantomData,
         })
@@ -194,11 +286,12 @@ where
     async fn connection_loop(
         endpoint: String,
         config: Config,
-        mut sender_rx: mpsc::UnboundedReceiver<String>,
+        mut sender_rx: mpsc::UnboundedReceiver<Outgoing>,
         broadcast_tx: broadcast::Sender<M>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
         evidence: Arc<Mutex<Evidence>>,
+        evidence_changed: watch::Sender<()>,
     ) {
         let mut attempt = 0_u32;
         let mut backoff: backoff::ExponentialBackoff = config.reconnect.clone().into();
@@ -221,6 +314,26 @@ where
                 Ok((ws_stream, _)) => {
                     attempt = 0;
                     backoff.reset();
+                    {
+                        let mut e = evidence
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let Some(epoch) = e.transport_epoch.checked_add(1) else {
+                            e.faults = e.faults.saturating_add(1);
+                            drop(e);
+                            evidence_changed.send_replace(());
+                            break;
+                        };
+                        let Some(start) = e.messages.checked_add(1) else {
+                            e.faults = e.faults.saturating_add(1);
+                            drop(e);
+                            evidence_changed.send_replace(());
+                            break;
+                        };
+                        e.transport_epoch = epoch;
+                        e.epoch_start_sequence = start;
+                    }
+                    evidence_changed.send_replace(());
                     _ = state_tx.send(ConnectionState::Connected {
                         since: Instant::now(),
                     });
@@ -234,6 +347,7 @@ where
                         config.clone(),
                         &parser,
                         &evidence,
+                        &evidence_changed,
                     )
                     .await
                     {
@@ -254,10 +368,13 @@ where
             }
 
             // Check if we should stop reconnecting
-            evidence
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .faults += 1;
+            {
+                let mut e = evidence
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                e.faults = e.faults.saturating_add(1);
+            }
+            evidence_changed.send_replace(());
             if let Some(max) = config.reconnect.max_attempts
                 && attempt >= max
             {
@@ -277,12 +394,13 @@ where
     /// Handle an active WebSocket connection.
     async fn handle_connection(
         ws_stream: WsStream,
-        sender_rx: &mut mpsc::UnboundedReceiver<String>,
+        sender_rx: &mut mpsc::UnboundedReceiver<Outgoing>,
         broadcast_tx: &broadcast::Sender<M>,
         state_rx: watch::Receiver<ConnectionState>,
         config: Config,
         parser: &P,
         evidence: &Mutex<Evidence>,
+        evidence_changed: &watch::Sender<()>,
     ) -> Result<()> {
         let (mut write, mut read) = ws_stream.split();
 
@@ -314,21 +432,36 @@ where
                                         #[cfg(feature = "tracing")]
                                         tracing::trace!(?message, "Parsed WebSocket message");
                                         let mut health = evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let faults_before = health.faults;
                                         // Detect overflow at publication, not when the stalled
                                         // subscription finally gets polled again.
                                         if broadcast_tx.len() >= BROADCAST_CAPACITY {
-                                            health.faults += 1;
+                                            health.faults = health.faults.saturating_add(1);
                                         }
                                         if health.receipts.len() == BROADCAST_CAPACITY {
                                             health.receipts.pop_front();
                                         }
                                         health.receipts.push_back(Instant::now());
-                                        health.messages += 1;
+                                        let Some(sequence) = health.messages.checked_add(1) else {
+                                            health.faults = health.faults.saturating_add(1);
+                                            drop(health);
+                                            evidence_changed.send_replace(());
+                                            heartbeat_handle.abort();
+                                            return Err(WsError::InvalidMessage("broadcast sequence exhausted".into()).into());
+                                        };
+                                        health.messages = sequence;
                                         _ = broadcast_tx.send(message);
+                                        let faulted = health.faults != faults_before;
+                                        drop(health);
+                                        if faulted { evidence_changed.send_replace(()); }
                                     }
                                 }
                                 Err(e) => {
-                                    evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner).faults += 1;
+                                    {
+                                        let mut health = evidence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        health.faults = health.faults.saturating_add(1);
+                                    }
+                                    evidence_changed.send_replace(());
                                     #[cfg(feature = "tracing")]
                                     tracing::warn!(%text, error = %e, "Failed to parse WebSocket message");
                                     #[cfg(not(feature = "tracing"))]
@@ -357,9 +490,14 @@ where
                 }
 
                 // Handle outgoing messages from subscriptions
-                Some(text) = sender_rx.recv() => {
-                    if write.send(Message::Text(text.into())).await.is_err() {
-                        break;
+                Some(command) = sender_rx.recv() => {
+                    let batch = match command {
+                        Outgoing::Single(text) => vec![text],
+                        Outgoing::Batch(batch) => batch,
+                    };
+                    if let Err(error) = write_batch(&mut write, batch).await {
+                        heartbeat_handle.abort();
+                        return Err(error.into());
                     }
                 }
 
@@ -449,7 +587,7 @@ where
     pub fn send<R: Serialize>(&self, request: &R) -> Result<()> {
         let json = serde_json::to_string(request)?;
         self.sender_tx
-            .send(json)
+            .send(Outgoing::Single(json))
             .map_err(|_e| WsError::ConnectionClosed)?;
         Ok(())
     }
@@ -462,7 +600,7 @@ where
     ) -> Result<()> {
         let json = request.as_authenticated(credentials)?;
         self.sender_tx
-            .send(json)
+            .send(Outgoing::Single(json))
             .map_err(|_e| WsError::ConnectionClosed)?;
         Ok(())
     }
@@ -471,6 +609,25 @@ where
     #[must_use]
     pub fn state(&self) -> ConnectionState {
         *self.state_rx.borrow()
+    }
+
+    pub(crate) fn publication(&self) -> Publication<'_, M> {
+        let evidence = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = (evidence.faults, evidence.transport_epoch);
+        Publication {
+            evidence: Some(evidence),
+            before,
+            changed: &self.evidence_changed,
+            sender: &self.sender_tx,
+            broadcast: &self.broadcast_tx,
+        }
+    }
+
+    pub(crate) fn evidence_changes(&self) -> watch::Receiver<()> {
+        self.evidence_changed.subscribe()
     }
 
     /// Inspect loss and queue age independently of the data receiver.
