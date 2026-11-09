@@ -651,7 +651,10 @@ impl<S: State> Client<S> {
         expected: &MetadataRevision,
     ) -> Result<MetadataRevision> {
         self.require_submission_client()?;
-        let tokens = tokens.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let tokens = tokens
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let mut revision = self.inner.metadata_state.check(expected)?;
         if !tokens.is_empty() {
             *revision = MetadataRevision::default();
@@ -1731,7 +1734,11 @@ impl Client<Unauthenticated> {
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            // Never replay an authenticated POST across an HTTP redirect.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         let geoblock_host = Url::parse(
             config
@@ -1908,6 +1915,28 @@ impl<K: Kind> Client<Authenticated<K>> {
     #[must_use]
     pub fn credentials(&self) -> &Credentials {
         &self.state().credentials
+    }
+
+    /// Read the actual authenticated signer tier using this client's pool/auth.
+    pub async fn rate_limit_tier(
+        &self,
+    ) -> Result<crate::http_observation::ObservedResponse<crate::http_observation::RateLimitTier>>
+    {
+        let request = self
+            .client()
+            .request(
+                Method::GET,
+                format!("{}v1/user/rate-limit-tier", self.host()),
+            )
+            .build()?;
+        let headers = self.create_headers(&request).await?;
+        crate::request_observed(
+            &self.inner.client,
+            request,
+            Some(headers),
+            Some(self.address()),
+        )
+        .await
     }
 
     /// Return all API keys associated with the address corresponding to the inner signer in
@@ -2162,6 +2191,14 @@ impl<K: Kind> Client<Authenticated<K>> {
     /// - The order price/size violates market rules
     /// - The request fails
     pub async fn post_order(&self, order: SignedOrder) -> Result<PostOrderResponse> {
+        self.post_order_observed(order).await.map(|r| r.data)
+    }
+
+    /// Same request and decoding with bounded transport-authored response evidence.
+    pub async fn post_order_observed(
+        &self,
+        order: SignedOrder,
+    ) -> Result<crate::http_observation::ObservedResponse<PostOrderResponse>> {
         self.require_submission_client()?;
         let request = self
             .client()
@@ -2170,7 +2207,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        let result = crate::request(&self.inner.client, request, Some(headers)).await;
+        let result = crate::request_observed(
+            &self.inner.client,
+            request,
+            Some(headers),
+            Some(self.address()),
+        )
+        .await;
         self.invalidate_version_if_mismatch(&result).await;
         result
     }
@@ -2185,6 +2228,14 @@ impl<K: Kind> Client<Authenticated<K>> {
     ///
     /// Returns an error if any order fails validation or the request fails.
     pub async fn post_orders(&self, orders: Vec<SignedOrder>) -> Result<Vec<PostOrderResponse>> {
+        self.post_orders_observed(orders).await.map(|r| r.data)
+    }
+
+    /// Same request and decoding with bounded transport-authored response evidence.
+    pub async fn post_orders_observed(
+        &self,
+        orders: Vec<SignedOrder>,
+    ) -> Result<crate::http_observation::ObservedResponse<Vec<PostOrderResponse>>> {
         self.require_submission_client()?;
         let request = self
             .client()
@@ -2193,7 +2244,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        let result = crate::request(&self.inner.client, request, Some(headers)).await;
+        let result = crate::request_observed(
+            &self.inner.client,
+            request,
+            Some(headers),
+            Some(self.address()),
+        )
+        .await;
         self.invalidate_version_if_mismatch(&result).await;
         result
     }
@@ -2216,7 +2273,14 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            request,
+            Some(headers),
+            Some(self.address()),
+        )
+        .await
+        .map(|r| r.data)
     }
 
     /// Retrieves a paginated list of orders matching the specified criteria.
@@ -2273,6 +2337,14 @@ impl<K: Kind> Client<Authenticated<K>> {
     ///
     /// Returns an error if any order ID is invalid or the request fails.
     pub async fn cancel_orders(&self, order_ids: &[&str]) -> Result<CancelOrdersResponse> {
+        self.cancel_orders_observed(order_ids).await.map(|r| r.data)
+    }
+
+    /// Same request and decoding with bounded transport-authored response evidence.
+    pub async fn cancel_orders_observed(
+        &self,
+        order_ids: &[&str],
+    ) -> Result<crate::http_observation::ObservedResponse<CancelOrdersResponse>> {
         let request = self
             .client()
             .request(Method::DELETE, format!("{}orders", self.host()))
@@ -2280,7 +2352,13 @@ impl<K: Kind> Client<Authenticated<K>> {
             .build()?;
         let headers = self.create_headers(&request).await?;
 
-        crate::request(&self.inner.client, request, Some(headers)).await
+        crate::request_observed(
+            &self.inner.client,
+            request,
+            Some(headers),
+            Some(self.address()),
+        )
+        .await
     }
 
     /// Cancels all open orders for the authenticated user.

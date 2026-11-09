@@ -33,6 +33,7 @@ pub struct Error {
     kind: Kind,
     source: Option<Box<dyn StdError + Send + Sync + 'static>>,
     backtrace: Backtrace,
+    observation: Option<crate::http_observation::ResponseMetadata>,
 }
 
 impl Error {
@@ -41,7 +42,23 @@ impl Error {
             kind,
             source: Some(Box::new(source)),
             backtrace: Backtrace::capture(),
+            observation: None,
         }
+    }
+
+    pub fn response_metadata(&self) -> Option<&crate::http_observation::ResponseMetadata> {
+        self.observation.as_ref().or_else(|| {
+            self.downcast_ref::<Status>()
+                .and_then(Status::response_metadata)
+        })
+    }
+
+    pub(crate) fn with_observation(
+        mut self,
+        observation: crate::http_observation::ResponseMetadata,
+    ) -> Self {
+        self.observation = Some(observation);
+        self
     }
 
     pub fn kind(&self) -> Kind {
@@ -79,6 +96,7 @@ impl Error {
             method,
             path,
             message: message.into(),
+            observation: None,
         }
         .into()
     }
@@ -113,6 +131,13 @@ pub struct Status {
     pub method: Method,
     pub path: String,
     pub message: String,
+    pub(crate) observation: Option<crate::http_observation::ResponseMetadata>,
+}
+
+impl Status {
+    pub fn response_metadata(&self) -> Option<&crate::http_observation::ResponseMetadata> {
+        self.observation.as_ref()
+    }
 }
 
 impl fmt::Display for Status {

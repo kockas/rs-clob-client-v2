@@ -12,6 +12,7 @@ pub mod data;
 pub mod error;
 #[cfg(feature = "gamma")]
 pub mod gamma;
+pub mod http_observation;
 #[cfg(feature = "rtds")]
 pub mod rtds;
 pub(crate) mod serde_helpers;
@@ -260,51 +261,113 @@ impl<T: Serialize> ToQueryParams for T {}
 )]
 async fn request<Response: DeserializeOwned>(
     client: &reqwest::Client,
-    mut request: Request,
+    request: Request,
     headers: Option<HeaderMap>,
 ) -> Result<Response> {
+    request_observed(client, request, headers, None)
+        .await
+        .map(|r| r.data)
+}
+
+/// Shared transport path. Signer context is supplied only by authenticated
+/// endpoint methods; public synthetic errors cannot manufacture this evidence.
+#[cfg(any(
+    feature = "bridge",
+    feature = "clob",
+    feature = "data",
+    feature = "gamma"
+))]
+async fn request_observed<Response: DeserializeOwned>(
+    client: &reqwest::Client,
+    mut request: Request,
+    headers: Option<HeaderMap>,
+    signer: Option<crate::types::Address>,
+) -> Result<http_observation::ObservedResponse<Response>> {
+    use http_observation::{ObservedResponse, ResponseMetadata};
+    use sha2::{Digest, Sha256};
     let method = request.method().clone();
     let path = request.url().path().to_owned();
-
+    let origin = request.url().origin().ascii_serialization();
     if let Some(h) = headers {
         request.headers_mut().extend(h);
     }
-
     let response = client.execute(request).await?;
     let status_code = response.status();
-
+    // No cookies, authentication material, arbitrary headers, or request body.
+    let bounded = |name: &str| -> Option<String> {
+        let mut values = response.headers().get_all(name).iter();
+        let value = values.next()?;
+        if values.next().is_some() || value.as_bytes().len() > 256 {
+            return None;
+        }
+        value.to_str().ok().map(str::to_owned)
+    };
+    let mut observation = ResponseMetadata {
+        method: method.clone(),
+        path: path.clone(),
+        request_origin: origin,
+        response_origin: response.url().origin().ascii_serialization(),
+        response_path: response.url().path().to_owned(),
+        status: status_code,
+        signer,
+        content_type: bounded("content-type"),
+        retry_after: bounded("retry-after"),
+        remaining: bounded("poly-ratelimit-remaining"),
+        reset: bounded("poly-ratelimit-reset"),
+        tier: bounded("poly-ratelimit-tier"),
+        body_hash: None,
+    };
+    let expected_lookup = signer.is_some()
+        && method == reqwest::Method::GET
+        && path
+            .strip_prefix("/data/order/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
     #[cfg(feature = "tracing")]
     tracing::Span::current().record("status_code", status_code.as_u16());
-
     if !status_code.is_success() {
         let message = response.text().await.unwrap_or_default();
-
+        observation.body_hash = Some(Sha256::digest(message.as_bytes()).into());
         #[cfg(feature = "tracing")]
-        tracing::warn!(
-            status = %status_code,
-            method = %method,
-            path = %path,
-            message = %message,
-            "API request failed"
-        );
-
-        return Err(Error::status(status_code, method, path, message));
+        if expected_lookup && status_code == StatusCode::NOT_FOUND {
+            tracing::debug!(status = %status_code, method = %method, path = %path, message = %message, "API request failed");
+        } else {
+            tracing::warn!(status = %status_code, method = %method, path = %path, message = %message, "API request failed");
+        }
+        return Err(error::Status {
+            status_code,
+            method,
+            path,
+            message,
+            observation: Some(observation),
+        }
+        .into());
     }
-
-    let json_value = response.json::<serde_json::Value>().await?;
-    let response_data: Option<Response> = serde_helpers::deserialize_with_warnings(json_value)?;
-
-    if let Some(response) = response_data {
-        Ok(response)
+    // Preserve the existing reqwest decode error and SDK deserialization types.
+    let json_value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| Error::from(e).with_observation(observation.clone()))?;
+    let response_data: Option<Response> = serde_helpers::deserialize_with_warnings(json_value)
+        .map_err(|e| e.with_observation(observation.clone()))?;
+    if let Some(data) = response_data {
+        Ok(ObservedResponse {
+            data,
+            observation: Some(observation),
+        })
     } else {
         #[cfg(feature = "tracing")]
-        tracing::warn!(method = %method, path = %path, "API resource not found");
+        if expected_lookup {
+            tracing::debug!(method = %method, path = %path, "API resource not found");
+        } else {
+            tracing::warn!(method = %method, path = %path, "API resource not found");
+        }
         Err(Error::status(
             StatusCode::NOT_FOUND,
             method,
             path,
             "Unable to find requested resource",
-        ))
+        )
+        .with_observation(observation))
     }
 }
 

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fork HTTP admission support
+
+- Add authenticated signer rate-tier reads and observed single/batch order and
+  batch-cancel methods using the existing HTTP pool and authentication helper.
+- Preserve response origin/path, method/status, signer, and bounded allowlisted
+  headers through successful decoding and typed status/decode/schema/null errors.
+  Synthetic errors and failures before receiving a response carry no observation.
+- CLOB clients now surface redirects as typed HTTP errors for all methods,
+  including reads; they never replay an authenticated order via a redirect.
+- Authenticated `GET /data/order/{id}` missing-order 404s log at DEBUG. Other
+  endpoints and statuses keep WARN; caller error and debt semantics are unchanged.
+- Successful maker responses return immediately without transaction-hash polling.
+
 ## [0.4.4](https://github.com/Polymarket/rs-clob-client/compare/v0.4.3...v0.4.4) - 2026-03-17
 
 ### Fixed
