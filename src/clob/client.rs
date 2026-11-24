@@ -2079,7 +2079,12 @@ impl<K: Kind> Client<Authenticated<K>> {
         let neg_risk = match payload {
             OrderPayload::V1(p) => self.neg_risk(p.order.tokenId).await?.neg_risk,
             OrderPayload::V2(p) => self.neg_risk(p.order.tokenId).await?.neg_risk,
-            OrderPayload::V3(_) => false,
+            OrderPayload::V3(_) => {
+                // Positions have no neg-risk lookup, but a preparation view
+                // must still belong to the admitted metadata revision.
+                drop(self.metadata_read()?);
+                false
+            }
         };
         let config = contract_config(chain_id, neg_risk)
             .ok_or(Error::missing_contract_config(chain_id, neg_risk))?;
